@@ -250,6 +250,8 @@ def execute_agent(input: dict[str, Any], config: AgentConfig, depth: int) -> str
     tracer.emit(
         "subagent_started",
         depth=depth,
+        agent_id=agent_id,
+        parent=config.session_tracer.session_id,
         subagent_type=subagent_type,
         description=description,
         allowed_tools=sorted(offered),

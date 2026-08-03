@@ -10,8 +10,8 @@ validation. **This repository strips all of it out and keeps only the
 architecture**: the turn loop, the three-layer tool-gating pipeline, context
 compaction, and inline tracing.
 
-About 2,600 lines. Standard library only — no `pip install` required.
-Optional: `litellm`, if you want multi-provider routing.
+About 4,200 lines. Standard library only — no `pip install` required, including
+the MCP client. Optional: `litellm`, if you want multi-provider routing.
 
 ---
 
@@ -158,17 +158,57 @@ You ask for a *role* (`local-fast`, `local-deep`, `frontier`), not a model. Each
 role carries an ordered fallback chain. See
 [ARCHITECTURE.md](ARCHITECTURE.md#multi-provider-routing).
 
-### 5. Run the tests
+### 5. MCP tools, parallel dispatch, and resume
+
+```bash
+python examples/demo_advanced.py
+```
+
+Offline, but the MCP part spawns a **real server subprocess** speaking actual
+JSON-RPC (`examples/mcp_echo_server.py`, ~110 lines of stdlib).
+
+```
+1. MCP — a real subprocess, bridged into the same registry
+  server     : echo-server v0.1.0
+  bridged    : mcp__echo__word_count, mcp__echo__reverse, mcp__echo__always_fails
+  risk class : escalate (remote tools are never auto-allowed)
+  no prompter: `mcp__echo__word_count` needs approval but no prompter is attached
+  with prompter:
+  ok  mcp__echo__word_count    5 words
+  ERR mcp__echo__always_fails  this tool always fails
+
+2. PARALLEL — same four reads, sequential vs concurrent
+  sequential       1.60s   results in order: file1 → file2 → file3 → file4
+  parallel (4)     0.40s   results in order: file1 → file2 → file3 → file4
+
+3. RESUME — rebuild the session by replaying the trace
+  replayed   : c816560ac05e → 8 messages
+  roles      : user assi tool assi tool assi user assi
+```
+
+Using them for real:
+
+```bash
+python -m claw_py.cli --mcp-config .mcp.json "..."          # bridge MCP servers
+python -m claw_py.cli --parallel-tools 4 "..."              # concurrent reads
+python -m claw_py.cli --trace t.jsonl --list-sessions       # what can I resume?
+python -m claw_py.cli --trace t.jsonl --resume "..."        # resume the latest
+python -m claw_py.cli --trace t.jsonl --resume a1b2c3 "..." # resume by id
+```
+
+### 6. Run the tests
 
 ```bash
 python -m unittest discover -s tests -v
 ```
 
-54 tests, no network, no model. They cover the loop, the iteration cap, tool
+91 tests, no network, no model. They cover the loop, the iteration cap, tool
 failures, all five permission modes, hook rewrite/deny/override, post-hook error
 flipping, compaction, the session health probe, subagent tool restriction, mode
-narrowing, depth limiting, hook inheritance, context isolation, and the router's
-fragmented-tool-call reassembly.
+narrowing, depth limiting, hook inheritance, context isolation, the router's
+fragmented-tool-call reassembly, MCP handshake/dispatch/concurrency against a
+real subprocess, trace replay including compaction and truncated writes, and
+parallel dispatch ordering guarantees.
 
 ---
 
@@ -189,16 +229,21 @@ claw-py/
 │   ├── hooks.py            lifecycle hooks and feedback merging
 │   ├── compact.py          token estimation and history rewriting
 │   ├── agents.py           subagents: the agent tool, restriction, depth
+│   ├── mcp.py              MCP stdio client and tool bridging
+│   ├── persistence.py      resume by replaying the trace
 │   ├── routing.py          optional LiteLLM multi-provider router
 │   ├── prompt.py           system prompt assembly
 │   ├── telemetry.py        inline trace events
 │   └── cli.py              REPL, one-shot mode, demo hooks
 ├── examples/
 │   ├── demo_offline.py     the gating pipeline, no model needed
-│   └── demo_subagents.py   delegation and isolation, no model needed
+│   ├── demo_subagents.py   delegation and isolation, no model needed
+│   ├── demo_advanced.py    MCP, parallel dispatch, resume
+│   └── mcp_echo_server.py  a real stdio MCP server, for testing
 └── tests/
     ├── test_loop.py        the loop, gating, compaction
-    └── test_agents.py      subagents and routing
+    ├── test_agents.py      subagents and routing
+    └── test_infra.py       MCP, persistence, parallel dispatch
 ```
 
 **If you read one file, read `claw_py/conversation.py`.** Everything else is a
@@ -221,6 +266,8 @@ Names match the Rust originals wherever Python allows it.
 | `compact.py` → `should_compact`, `compact_session` | `runtime/src/compact.rs` |
 | `prompt.py` → `build_system_prompt` | `runtime/src/prompt.rs` |
 | `agents.py` → `execute_agent`, `allowed_tools_for_subagent` | `tools/src/lib.rs` |
+| `mcp.py` → `McpClient`, `bridge_mcp_tool` | `runtime/src/mcp_tool_bridge.rs` |
+| `persistence.py` → `replay_session` | (diverges — see below) |
 | `routing.py` → `RoutedApiClient` | (no direct analogue — replaces `api/src/providers/`) |
 | `telemetry.py` → `SessionTracer` | `telemetry/src/lib.rs` |
 | `cli.py` | `rusty-claude-cli` |
@@ -245,10 +292,16 @@ These are cuts, not oversights. Each is a place the original does more.
 - **Token estimation is `len(chars) // 4`**, not a real tokeniser.
 - **No session persistence, resume, or fork-to-disk.** `Session.fork_session`
   exists but only copies in memory.
-- **No MCP client.** Sketched in [ARCHITECTURE.md](ARCHITECTURE.md#mcp-tools) —
-  a small addition precisely because the tool pipeline is one choke point.
 - **Subagents run sequentially and share one workspace.** A production harness
   would sandbox each one and may run them in parallel.
+- **Only stdio MCP transport.** No HTTP/SSE servers, no resources or prompts —
+  just `initialize`, `tools/list`, `tools/call`.
+- **Parallelism is per-batch, not global.** Consecutive read-only calls batch;
+  a write ends the batch. Safe, but leaves throughput on the table.
+- **Persistence diverges from the original deliberately.** claw-code serialises
+  session state to its own file. Here the trace *is* the store, and resuming is
+  a fold over it — so a resumed session cannot silently disagree with its own
+  trace. See [ARCHITECTURE.md](ARCHITECTURE.md#session-persistence-and-resume).
 - **`types.RuntimeError` deliberately shadows the builtin** inside this package
   to match the Rust name. It is imported explicitly everywhere it is used.
 

@@ -7,6 +7,8 @@ and you have the design.
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
 from .api import ApiClient, build_assistant_message
@@ -25,7 +27,7 @@ from .permissions import (
     PermissionPrompter,
 )
 from .telemetry import SessionTracer
-from .tools import ToolError, ToolExecutor
+from .tools import RISK_READ, ToolExecutor
 from .types import (
     ApiRequest,
     CompactionRecord,
@@ -35,6 +37,17 @@ from .types import (
     TurnSummary,
     UsageTracker,
 )
+
+
+@dataclass
+class ToolPlan:
+    """One authorized (or denied) tool call, before execution."""
+
+    tool_use_id: str
+    tool_name: str
+    effective_input: dict[str, Any]
+    pre_hook_result: HookResult
+    permission_outcome: PermissionOutcome
 
 
 class ConversationRuntime:
@@ -49,6 +62,7 @@ class ConversationRuntime:
         session_tracer: Optional[SessionTracer] = None,
         max_iterations: int = 12,
         compaction_config: Optional[CompactionConfig] = None,
+        parallel_tools: int = 1,
         on_text: Optional[Callable[[str], None]] = None,
     ) -> None:
         self.api_client = api_client
@@ -60,6 +74,7 @@ class ConversationRuntime:
         self.session_tracer = session_tracer or SessionTracer(self.session.session_id)
         self.max_iterations = max_iterations
         self.compaction_config = compaction_config or CompactionConfig()
+        self.parallel_tools = max(1, parallel_tools)
         self.usage_tracker = UsageTracker()
         self.on_text = on_text
 
@@ -86,6 +101,7 @@ class ConversationRuntime:
 
         self.record_turn_started(user_input)
         self.session.push_user_text(user_input)
+        self.record_message_appended(self.session.messages[-1])
 
         assistant_messages: list[ConversationMessage] = []
         tool_results: list[ConversationMessage] = []
@@ -124,6 +140,7 @@ class ConversationRuntime:
             )
 
             self.session.push_message(assistant_message)
+            self.record_message_appended(assistant_message)
             assistant_messages.append(assistant_message)
 
             # Runs before the next API call, including on the terminal
@@ -135,11 +152,23 @@ class ConversationRuntime:
             if not pending_tool_uses:
                 break
 
-            for tool_use_id, tool_name, input in pending_tool_uses:
-                result_message = self._run_tool_call(
-                    iterations, tool_use_id, tool_name, input, prompter
-                )
+            # Phase 1 (sequential, in order): hooks and permission decisions.
+            # Kept serial so hook ordering is deterministic and only one
+            # permission prompt can ever be in front of the user at a time.
+            plans = [
+                self._authorize_tool_call(tool_use_id, tool_name, input, prompter)
+                for tool_use_id, tool_name, input in pending_tool_uses
+            ]
+
+            # Phase 2: execution. Runs of consecutive read-only tools go in
+            # parallel; anything else runs in order.
+            outcomes = self._dispatch_tool_plans(iterations, plans)
+
+            # Phase 3 (sequential, in original order): post-hooks and results.
+            for plan, (output, is_error) in zip(plans, outcomes):
+                result_message = self._finalize_tool_call(plan, output, is_error)
                 self.session.push_message(result_message)
+                self.record_message_appended(result_message)
                 self.record_tool_finished(iterations, result_message)
                 tool_results.append(result_message)
 
@@ -157,14 +186,14 @@ class ConversationRuntime:
     # tool call pipeline: hook -> permission -> execute -> hook
     # ------------------------------------------------------------------
 
-    def _run_tool_call(
+    def _authorize_tool_call(
         self,
-        iterations: int,
         tool_use_id: str,
         tool_name: str,
         input: dict[str, Any],
         prompter: Optional[PermissionPrompter],
-    ) -> ConversationMessage:
+    ) -> ToolPlan:
+        """Everything up to, but not including, running the tool."""
         pre_hook_result = self.run_pre_tool_use_hook(tool_name, input)
 
         # A hook may rewrite the arguments. The model is never told.
@@ -200,34 +229,95 @@ class ConversationRuntime:
                 tool_name, effective_input, permission_context, prompter
             )
 
-        if not permission_outcome.allowed:
-            return ConversationMessage.tool_result(
-                tool_use_id,
-                tool_name,
-                merge_hook_feedback(
-                    pre_hook_result.messages(), permission_outcome.reason, True
-                ),
-                True,
-            )
+        return ToolPlan(
+            tool_use_id=tool_use_id,
+            tool_name=tool_name,
+            effective_input=effective_input,
+            pre_hook_result=pre_hook_result,
+            permission_outcome=permission_outcome,
+        )
 
-        self.record_tool_started(iterations, tool_name)
+    def _is_parallel_safe(self, plan: ToolPlan) -> bool:
+        """Only idempotent reads run concurrently. Writes keep their order."""
+        return self.tool_executor.risk_for(plan.tool_name) == RISK_READ
+
+    def _dispatch_tool_plans(
+        self, iterations: int, plans: list[ToolPlan]
+    ) -> list[tuple[str, bool]]:
+        """Execute authorized plans, batching consecutive read-only runs.
+
+        Grouping into *runs* rather than partitioning by risk preserves the
+        relative order of reads and writes: a write never overtakes a read that
+        the model requested before it.
+        """
+        results: list[tuple[str, bool]] = [("", False)] * len(plans)
+        batch: list[int] = []
+
+        def flush() -> None:
+            if not batch:
+                return
+            if len(batch) == 1:
+                index = batch[0]
+                results[index] = self._execute_tool_plan(iterations, plans[index])
+            else:
+                self.record_parallel_batch(iterations, [plans[i].tool_name for i in batch])
+                workers = min(len(batch), self.parallel_tools)
+                with ThreadPoolExecutor(max_workers=workers) as pool:
+                    futures = {
+                        pool.submit(self._execute_tool_plan, iterations, plans[i]): i
+                        for i in batch
+                    }
+                    for future in as_completed(futures):
+                        results[futures[future]] = future.result()
+            batch.clear()
+
+        for index, plan in enumerate(plans):
+            if not plan.permission_outcome.allowed:
+                flush()
+                results[index] = (
+                    merge_hook_feedback(
+                        plan.pre_hook_result.messages(),
+                        plan.permission_outcome.reason,
+                        True,
+                    ),
+                    True,
+                )
+                continue
+            if self.parallel_tools > 1 and self._is_parallel_safe(plan):
+                batch.append(index)
+            else:
+                flush()
+                results[index] = self._execute_tool_plan(iterations, plan)
+        flush()
+        return results
+
+    def _execute_tool_plan(self, iterations: int, plan: ToolPlan) -> tuple[str, bool]:
+        """The parallel-safe part: run the tool, capture failure as data."""
+        self.record_tool_started(iterations, plan.tool_name)
         try:
-            output = self.tool_executor.execute(tool_name, effective_input)
+            output = self.tool_executor.execute(plan.tool_name, plan.effective_input)
             is_error = False
-        except (ToolError, Exception) as error:  # noqa: BLE001
+        except Exception as error:  # noqa: BLE001
             # A tool failure is data for the model, not a crash.
             output = str(error)
             is_error = True
+        return merge_hook_feedback(plan.pre_hook_result.messages(), output, False), is_error
 
-        output = merge_hook_feedback(pre_hook_result.messages(), output, False)
+    def _finalize_tool_call(
+        self, plan: ToolPlan, output: str, is_error: bool
+    ) -> ConversationMessage:
+        if not plan.permission_outcome.allowed:
+            return ConversationMessage.tool_result(
+                plan.tool_use_id, plan.tool_name, output, True
+            )
 
         if is_error:
             post_hook_result = self.run_post_tool_use_failure_hook(
-                tool_name, effective_input, output
+                plan.tool_name, plan.effective_input, output
             )
         else:
             post_hook_result = self.run_post_tool_use_hook(
-                tool_name, effective_input, output
+                plan.tool_name, plan.effective_input, output
             )
 
         post_rejected = (
@@ -239,7 +329,9 @@ class ConversationRuntime:
             is_error = True
         output = merge_hook_feedback(post_hook_result.messages(), output, post_rejected)
 
-        return ConversationMessage.tool_result(tool_use_id, tool_name, output, is_error)
+        return ConversationMessage.tool_result(
+            plan.tool_use_id, plan.tool_name, output, is_error
+        )
 
     # ------------------------------------------------------------------
     # hooks
@@ -280,6 +372,7 @@ class ConversationRuntime:
             self.session_tracer.emit(
                 "auto_compaction",
                 dropped_messages=result.record.dropped_messages,
+                summary=result.record.summary,
                 before_tokens=result.record.before_tokens,
                 after_tokens=result.record.after_tokens,
             )
@@ -321,6 +414,19 @@ class ConversationRuntime:
             iteration=iterations,
             text_chars=len(assistant_message.text()),
             pending_tool_uses=pending,
+        )
+
+    def record_message_appended(self, message: ConversationMessage) -> None:
+        """The event that makes the trace a complete, resumable log."""
+        from .persistence import serialize_message
+
+        self.session_tracer.emit(
+            "message_appended", message=serialize_message(message)
+        )
+
+    def record_parallel_batch(self, iterations: int, tool_names: list[str]) -> None:
+        self.session_tracer.emit(
+            "parallel_batch", iteration=iterations, tools=sorted(tool_names)
         )
 
     def record_tool_started(self, iterations: int, tool_name: str) -> None:

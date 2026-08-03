@@ -15,6 +15,8 @@ from .agents import AGENT_SPECS, AgentConfig, build_tool_executor
 from .api import DEFAULT_BASE_URL, DEFAULT_MODEL, ApiClient
 from .compact import CompactionConfig
 from .conversation import ConversationRuntime
+from .mcp import McpError, McpServerManager, load_mcp_config
+from .persistence import format_session_list, list_sessions, replay_session
 from .hooks import HookEvent, HookRegistry, HookResult
 from .permissions import ConsolePrompter, PermissionMode, PermissionPolicy
 from .prompt import build_system_prompt
@@ -76,7 +78,17 @@ def default_hook_registry() -> HookRegistry:
 def build_runtime(args: argparse.Namespace) -> ConversationRuntime:
     cwd = Path(args.cwd).expanduser().resolve()
     permission_mode = PermissionMode.from_str(args.permission_mode)
-    session = Session()
+    if args.resume:
+        if not args.trace:
+            raise SystemExit("--resume needs --trace pointing at the trace file")
+        session = replay_session(Path(args.trace), None if args.resume == "last" else args.resume)
+        print(
+            f"  resumed session {session.session_id} "
+            f"({len(session.messages)} message(s))",
+            file=sys.stderr,
+        )
+    else:
+        session = Session()
     session_tracer = SessionTracer(
         session.session_id,
         path=Path(args.trace) if args.trace else None,
@@ -97,8 +109,30 @@ def build_runtime(args: argparse.Namespace) -> ConversationRuntime:
         def client_factory(model: str) -> ApiClient:
             return ApiClient(model=model or args.model, base_url=args.base_url)
 
+    # MCP servers start before tool assembly so their tools join the registry
+    # like any other, and inherit the same hook and permission pipeline.
+    mcp_specs: list = []
+    mcp_manager = None
+    if args.mcp_config:
+        try:
+            configs = load_mcp_config(Path(args.mcp_config).expanduser())
+            mcp_manager = McpServerManager(configs)
+            mcp_specs = mcp_manager.start_all()
+            if mcp_specs:
+                print(
+                    f"  mcp: {len(mcp_specs)} tool(s) from "
+                    f"{', '.join(sorted(mcp_manager.clients))}",
+                    file=sys.stderr,
+                )
+            for name, reason in mcp_manager.failures.items():
+                print(f"  mcp: server `{name}` unavailable ({reason})", file=sys.stderr)
+        except (McpError, OSError, ValueError) as error:
+            print(f"  mcp: {error}", file=sys.stderr)
+
     if args.no_subagents:
         tool_executor = default_tool_executor()
+        for spec in mcp_specs:
+            tool_executor.register(spec)
     else:
         agent_config = AgentConfig(
             client_factory=client_factory,
@@ -108,6 +142,7 @@ def build_runtime(args: argparse.Namespace) -> ConversationRuntime:
             parent_mode=permission_mode,
             subagent_model=args.subagent_model or args.model,
             max_depth=args.max_agent_depth,
+            extra_tools=mcp_specs,  # subagents see MCP tools too
         )
         tool_executor = build_tool_executor(agent_config, depth=0)
 
@@ -116,13 +151,19 @@ def build_runtime(args: argparse.Namespace) -> ConversationRuntime:
     api_client = client_factory(args.model)
     api_client.tool_specs = tool_executor.wire_specs()
 
-    permission_policy = PermissionPolicy(mode=permission_mode, workspace_root=cwd)
+    permission_policy = PermissionPolicy(
+        mode=permission_mode,
+        workspace_root=cwd,
+        # Classify by declared risk, not by name. Bridged MCP tools default to
+        # `escalate`, so an unfamiliar remote tool is never auto-allowed.
+        risk_lookup=tool_executor.risk_for,
+    )
 
     if memory_files:
         loaded = ", ".join(str(m.path.name) for m in memory_files)
         print(f"  loaded project memory: {loaded}", file=sys.stderr)
 
-    return ConversationRuntime(
+    runtime = ConversationRuntime(
         api_client=api_client,
         tool_executor=tool_executor,
         permission_policy=permission_policy,
@@ -132,8 +173,11 @@ def build_runtime(args: argparse.Namespace) -> ConversationRuntime:
         session_tracer=session_tracer,
         max_iterations=args.max_iterations,
         compaction_config=CompactionConfig(threshold_tokens=args.compact_threshold),
+        parallel_tools=args.parallel_tools,
         on_text=lambda chunk: print(chunk, end="", flush=True),
     )
+    runtime.mcp_manager = mcp_manager  # so main() can shut it down
+    return runtime
 
 
 def render_summary(runtime: ConversationRuntime, summary: Any) -> None:
@@ -147,6 +191,13 @@ def render_summary(runtime: ConversationRuntime, summary: Any) -> None:
     if summary.auto_compaction is not None:
         line += f" compacted {summary.auto_compaction.dropped_messages} msg(s)"
     print(f"\n{line}", file=sys.stderr)
+
+
+def shutdown(runtime: ConversationRuntime) -> None:
+    manager = getattr(runtime, "mcp_manager", None)
+    if manager is not None:
+        manager.stop_all()
+    runtime.session_tracer.close()
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -163,6 +214,26 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--max-iterations", type=int, default=12)
     parser.add_argument("--compact-threshold", type=int, default=3000)
     parser.add_argument("--trace", default=None, help="write JSONL trace to this path")
+    parser.add_argument(
+        "--mcp-config", default=None, help="path to a .mcp.json server config"
+    )
+    parser.add_argument(
+        "--resume",
+        nargs="?",
+        const="last",
+        default=None,
+        metavar="SESSION_ID",
+        help="resume a session by replaying --trace; omit the id for the latest",
+    )
+    parser.add_argument(
+        "--list-sessions", action="store_true", help="list resumable sessions in --trace"
+    )
+    parser.add_argument(
+        "--parallel-tools",
+        type=int,
+        default=1,
+        help="max concurrent read-only tool calls; 1 disables parallelism",
+    )
     parser.add_argument(
         "--router",
         default="ollama",
@@ -186,6 +257,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("-v", "--verbose", action="store_true", help="echo trace events")
     args = parser.parse_args(argv)
 
+    if args.list_sessions:
+        if not args.trace:
+            raise SystemExit("--list-sessions needs --trace pointing at the trace file")
+        print(format_session_list(list_sessions(Path(args.trace))))
+        return 0
+
     runtime = build_runtime(args)
     prompter = ConsolePrompter()
 
@@ -195,6 +272,8 @@ def main(argv: list[str] | None = None) -> int:
         except RuntimeError as error:
             print(f"\nerror: {error.message}", file=sys.stderr)
             return 1
+        finally:
+            shutdown(runtime)
         render_summary(runtime, summary)
         return 0
 
@@ -207,10 +286,12 @@ def main(argv: list[str] | None = None) -> int:
             user_input = input("\n> ").strip()
         except (EOFError, KeyboardInterrupt):
             print()
+            shutdown(runtime)
             return 0
         if not user_input:
             continue
         if user_input in {"/exit", "/quit"}:
+            shutdown(runtime)
             return 0
         try:
             summary = runtime.run_turn(user_input, prompter)

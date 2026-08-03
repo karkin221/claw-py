@@ -26,6 +26,9 @@ Every section names the Python file in this repo and the Rust file in
 - [Cross-cutting: tracing and replay](#cross-cutting-tracing-and-replay)
 - [Subagents](#subagents)
 - [Multi-provider routing](#multi-provider-routing)
+- [MCP tools](#mcp-tools)
+- [Session persistence and resume](#session-persistence-and-resume)
+- [Parallel tool dispatch](#parallel-tool-dispatch)
 - [Three design decisions worth stealing](#three-design-decisions-worth-stealing)
 - [Still missing](#still-missing)
 
@@ -349,7 +352,7 @@ The error handling is the design point:
 
 ```python
 try:
-    output = self.tool_executor.execute(tool_name, effective_input)
+    output = self.tool_executor.execute(plan.tool_name, plan.effective_input)
     is_error = False
 except Exception as error:
     output = str(error)
@@ -365,6 +368,11 @@ iteration. A model that tries to read a nonexistent file gets told so and can
 `ToolSpec` — an MCP-bridged tool, a plugin, a subagent — registers here and
 inherits the identical hook and permission path as the built-ins. That single
 choke point is the property that makes the whole design worth copying.
+
+Each `ToolSpec` also declares a `risk` (`read` / `write` / `escalate`), which
+drives both the permission default and whether the call is eligible to run
+concurrently. See [MCP tools](#mcp-tools) and
+[Parallel tool dispatch](#parallel-tool-dispatch).
 
 ---
 
@@ -683,6 +691,211 @@ all of this without needing litellm installed.
 
 ---
 
+## MCP tools
+
+**Python:** `claw_py/mcp.py`
+**Rust:** `runtime/src/mcp_tool_bridge.rs`
+
+An MCP server is a subprocess speaking JSON-RPC 2.0 over newline-delimited
+stdin/stdout. `McpClient` spawns it, runs the handshake, lists its tools, and
+`bridge_mcp_tool` wraps each one as an ordinary `ToolSpec`:
+
+```python
+def bridge_mcp_tool(client, tool, risk=RISK_ESCALATE) -> ToolSpec:
+    def handler(input):
+        return client.call_tool(tool.name, input)
+    return ToolSpec(
+        name=tool.qualified_name,          # mcp__{server}__{tool}
+        description=f"[{tool.server}] {tool.description}",
+        input_schema=normalize_schema(tool.input_schema),
+        handler=handler,
+        risk=risk,
+    )
+```
+
+**That is the entire integration.** Once it is a `ToolSpec` it enters the same
+registry as `read_file` and takes the same path through Stages 6-9. There is no
+`if is_mcp_tool` anywhere in `conversation.py` — which is precisely the property
+you want, because remote tools are the ones you least want skipping a gate.
+
+The demo shows it: a bridged tool is denied without a prompter, allowed with
+one, and a hook can veto it. Identical behaviour to `bash`.
+
+### Risk classification, and why it had to change
+
+The permission policy originally classified tools by hardcoded name:
+
+```python
+WRITE_TOOLS = {"write_file", "edit_file", "bash"}
+```
+
+That cannot classify `mcp__github__create_issue`. Worse, it *fails open* — an
+unrecognised name fell through to `Allow()`, so bridging MCP tools would have
+silently auto-approved every remote tool under `workspace-write`.
+
+So `ToolSpec` now declares its own risk, and the policy consults it:
+
+```python
+RISK_READ      # idempotent, no side effects, safe to run concurrently
+RISK_WRITE     # mutates the workspace; runs in order
+RISK_ESCALATE  # needs explicit approval
+```
+
+`ToolExecutor.risk_for()` returns `RISK_ESCALATE` for unknown tools — **failing
+closed**. Bridged MCP tools default to `RISK_ESCALATE` too, so under
+`workspace-write` a remote tool always requires approval. Override per server
+with `"risk": "read"` in the config if you trust it.
+
+The policy still falls back to the old name sets when no `risk_lookup` is
+supplied, so nothing that existed before changed behaviour.
+
+### Server lifecycle
+
+`McpServerManager` starts every configured server and returns the combined
+specs. A server that fails to start is recorded in `.failures` and **skipped** —
+one broken server degrades the tool list rather than preventing startup.
+
+Configuration is the familiar `.mcp.json` shape:
+
+```json
+{"mcpServers": {"echo": {"command": "python", "args": ["server.py"]}}}
+```
+
+Two details worth noting. `McpClient.request` holds a lock, because parallel
+dispatch can call two tools on one server concurrently and JSON-RPC responses
+must stay matched to their requests — there is a test that hammers this with
+eight threads. And stderr is drained on a background thread into a 50-line ring
+buffer, so a server that dies mid-session produces a diagnosable error instead
+of a silent hang.
+
+---
+
+## Session persistence and resume
+
+**Python:** `claw_py/persistence.py`
+
+This is the one place the design **deliberately diverges** from the original.
+
+claw-code serialises session state to its own `.jsonl` file, separate from its
+telemetry stream. That means two sources of truth that can disagree — and in
+practice, a session file that says one thing while the trace says another is
+very unpleasant to debug.
+
+Here, **the trace is the store**. `SessionTracer` already emitted an event at
+every point the session changed; adding the message content to those events
+makes the trace a complete ordered log:
+
+```python
+def record_message_appended(self, message: ConversationMessage) -> None:
+    self.session_tracer.emit("message_appended", message=serialize_message(message))
+```
+
+Called at exactly the three points a message enters the session: the user turn,
+each assistant message, and each tool result.
+
+Resuming is then a **fold over the log**, not a deserialisation:
+
+```python
+for event in read_events(path):
+    if event.get("session_id") != session_id:
+        continue
+    if event["kind"] == "message_appended":
+        messages.append(deserialize_message(event["message"]))
+    elif event["kind"] == "auto_compaction":
+        messages = [get_compact_continuation_message(summary), *messages[dropped:]]
+```
+
+Three properties fall out of this for free:
+
+**1. A resumed session cannot disagree with its own trace**, because they are
+the same artifact.
+
+**2. Compaction replays as an operation, not a result.** The event records how
+many messages were dropped and the summary that replaced them; replay applies
+*exactly the transformation `compact_session` applied*. No compacted state is
+ever stored — only the instruction that produced it.
+
+**3. A truncated trace still resumes.** `read_events` skips an unparseable final
+line, so a process killed mid-write resumes to its last consistent point. There
+is a test that appends `{"ts": 1, "kind": "message_app` and asserts the replay
+is still complete.
+
+Subagents share the trace file but have their own `session_id`, so filtering
+gives isolation for free — and because `subagent_started` records its `parent`,
+a whole delegation tree reconstructs in one pass:
+
+```bash
+python -m claw_py.cli --trace t.jsonl --list-sessions
+```
+
+```
+session        turns  msgs  cmpt  first prompt
+179425a9acc3       1     4     0  summarise my notes
+```
+
+---
+
+## Parallel tool dispatch
+
+**Python:** `claw_py/conversation.py` → `_dispatch_tool_plans`
+
+Stage 8 originally ran pending calls in a simple loop. Making that concurrent
+safely required splitting the pipeline into three phases:
+
+| Phase | What | Concurrency |
+|---|---|---|
+| 1. Authorize | PreToolUse hook + permission check | **sequential** |
+| 2. Execute | run the tool | **batched parallel** |
+| 3. Finalize | PostToolUse hook + build result | **sequential** |
+
+Phase 1 must stay serial for two reasons: hook ordering has to be deterministic,
+and **only one permission prompt can be in front of the user at a time**. Two
+threads racing for stdin is not a user experience anyone wants. Phase 3 stays
+serial so results land in request order regardless of completion order.
+
+### Batching, not partitioning
+
+The obvious implementation — run all reads concurrently, all writes after — is
+wrong. It lets a write overtake a read the model requested *before* it, which
+silently reorders the model's intent.
+
+Instead, `_dispatch_tool_plans` groups **runs of consecutive parallel-safe
+calls**:
+
+```python
+for index, plan in enumerate(plans):
+    if not plan.permission_outcome.allowed:
+        flush(); results[index] = denied(plan); continue
+    if self.parallel_tools > 1 and self._is_parallel_safe(plan):
+        batch.append(index)
+    else:
+        flush()
+        results[index] = self._execute_tool_plan(iterations, plan)
+flush()
+```
+
+`[read, read, write, read]` becomes: two reads concurrently, then the write
+alone, then the last read. Relative order is preserved; only genuinely
+independent work overlaps.
+
+`_is_parallel_safe` is just `risk == RISK_READ` — so the classification added
+for MCP does double duty here.
+
+### Measured
+
+From `demo_advanced.py`, four reads at 0.4s each:
+
+```
+sequential       1.60s   results in order: file1 → file2 → file3 → file4
+parallel (4)     0.40s   results in order: file1 → file2 → file3 → file4
+```
+
+Default is `parallel_tools=1` — opt in with `--parallel-tools 4`. Tests assert
+the timing, the ordering, that writes never overlap, and that denied calls still
+land in position.
+
+---
+
 ## Three design decisions worth stealing
 
 **1. Failure is data, not control flow.** Tool errors, permission denials, and
@@ -691,17 +904,19 @@ them and adapts. Only the iteration cap and provider failures abort a turn. This
 single choice is what lets an agent operate under a restrictive policy without a
 human babysitting it.
 
-**2. One choke point for every tool.** Built-ins, subagents, and (were they
-implemented) MCP-bridged tools all pass through the same hook → permission →
-execute → hook pipeline. Adding a capability cannot accidentally add a bypass,
-because there is only one path. Delegation being *a tool* rather than a runtime
-feature is the sharpest example.
+**2. One choke point for every tool.** Built-ins, subagents, and MCP-bridged
+tools all pass through the same hook → permission → execute → hook pipeline.
+Adding a capability cannot accidentally add a bypass, because there is only one
+path. `conversation.py` contains no `if is_mcp_tool` and no `if is_subagent` —
+both are just tools. It is also why parallel dispatch could be added by
+restructuring one function rather than auditing many.
 
 **3. Trace at the point of action.** Emitting structured events inline — rather
 than logging and reconstructing later — makes replay a property of the system
-rather than a project. With subagents this pays double: the parent's trace and
-every subagent's trace share one file, distinguished by `session_id` and
-`depth`, so a whole delegation tree is one grep away.
+rather than a project. This one compounded further than expected: once the trace
+was complete, *session persistence came free*, because resuming is a fold over a
+log you were already writing. Two features for the price of one, and no second
+source of truth to disagree with the first.
 
 And one to be careful about: **hooks outrank the permission policy in both
 directions**, and they are inherited by subagents. That is correct — it is what
@@ -712,26 +927,20 @@ hooks is as trusted as the harness itself.
 
 ## Still missing
 
-### MCP tools
+Everything below is a real gap, not a stub.
 
-Anything producing a `ToolSpec` can be handed to `ToolExecutor.register()`, or
-passed as `AgentConfig.extra_tools` so subagents get it too. Bridged tools then
-inherit the identical hook and permission path as the built-ins — exactly what
-you want, since remote tools are the ones you least want bypassing your gates.
+**HTTP/SSE MCP transport.** Only stdio is implemented. The `McpClient` interface
+would not change — just the framing.
 
-The work is in the transport, not the integration: an MCP stdio client, schema
-translation, and server lifecycle. In the Rust original that is about 3,000
-lines, and almost none of it is architecture.
+**MCP resources and prompts.** Only `tools/*` is wired. Resources would most
+naturally arrive as context rather than as tools.
 
-### Session persistence and resume
+**Sandboxed subagents.** They currently share the parent's workspace and
+filesystem. Isolating each one is the obvious next safety step.
 
-`Session.fork_session` copies in memory but nothing writes to disk. Since the
-trace already contains every event, resume could be built by replaying the JSONL
-rather than by serialising session state — which would be a better design than
-the original's.
+**Parallel subagents.** `agent` is `RISK_ESCALATE`, so delegations never batch.
+Running independent explorations concurrently is the biggest remaining
+throughput win, and the phase split already makes it structurally possible.
 
-### Parallel tool dispatch
-
-Stage 8 runs pending calls sequentially. Independent calls could run
-concurrently, though the permission prompt and hook ordering both need thought
-before that is safe.
+**A real tokeniser.** `len(chars) // 4` drives compaction. Fine for a threshold,
+wrong for anything you would bill on.

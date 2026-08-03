@@ -23,12 +23,19 @@ class ToolError(Exception):
     """Raised by a handler. Becomes an is_error tool result, not a crash."""
 
 
+# Risk classes drive both permission defaults and parallel-dispatch eligibility.
+RISK_READ = "read"        # idempotent, no side effects, safe to run concurrently
+RISK_WRITE = "write"      # mutates the workspace; runs in order
+RISK_ESCALATE = "escalate"  # needs explicit approval; runs in order
+
+
 @dataclass
 class ToolSpec:
     name: str
     description: str
     input_schema: dict[str, Any]
     handler: Callable[[dict[str, Any]], str]
+    risk: str = RISK_READ
 
     def to_wire(self) -> dict[str, Any]:
         return {
@@ -52,6 +59,11 @@ class ToolExecutor:
 
     def names(self) -> list[str]:
         return sorted(self._specs)
+
+    def risk_for(self, tool_name: str) -> str:
+        spec = self._specs.get(tool_name)
+        # Unknown tools are treated as dangerous, not as harmless.
+        return spec.risk if spec is not None else RISK_ESCALATE
 
     def wire_specs(self, names: Optional[set[str]] = None) -> list[dict[str, Any]]:
         """Schemas sent to the model. Filter by `names` to restrict a subagent."""
@@ -215,6 +227,7 @@ def default_tool_executor() -> ToolExecutor:
                 "required": ["path", "content"],
             },
             write_file,
+            risk=RISK_WRITE,
         ),
         ToolSpec(
             "edit_file",
@@ -229,6 +242,7 @@ def default_tool_executor() -> ToolExecutor:
                 "required": ["path", "old_str", "new_str"],
             },
             edit_file,
+            risk=RISK_WRITE,
         ),
         ToolSpec(
             "glob_search",
@@ -265,6 +279,7 @@ def default_tool_executor() -> ToolExecutor:
                 "required": ["command"],
             },
             bash,
+            risk=RISK_ESCALATE,
         ),
         ToolSpec(
             "todo_write",
@@ -275,6 +290,7 @@ def default_tool_executor() -> ToolExecutor:
                 "required": ["todos"],
             },
             todo_write,
+            risk=RISK_WRITE,
         ),
     ]:
         executor.register(spec)

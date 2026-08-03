@@ -10,10 +10,15 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Any, Optional, Protocol
+from typing import Any, Callable, Optional, Protocol
 
-WRITE_TOOLS = {"write_file", "edit_file", "bash"}
+# Fallback classification, used when no risk_lookup is supplied.
+WRITE_TOOLS = {"write_file", "edit_file", "bash", "todo_write"}
 ESCALATED_TOOLS = {"bash"}
+
+RISK_READ = "read"
+RISK_WRITE = "write"
+RISK_ESCALATE = "escalate"
 
 
 class PermissionMode(Enum):
@@ -78,10 +83,23 @@ class PermissionPolicy:
         mode: PermissionMode = PermissionMode.WORKSPACE_WRITE,
         workspace_root: Optional[Path] = None,
         allowed_tools: Optional[set[str]] = None,
+        risk_lookup: Optional[Callable[[str], str]] = None,
     ) -> None:
         self.mode = mode
         self.workspace_root = (workspace_root or Path.cwd()).resolve()
         self.allowed_tools = allowed_tools
+        # Where a tool's risk class comes from. Without this the policy falls
+        # back to hardcoded name sets, which cannot classify bridged MCP tools.
+        self.risk_lookup = risk_lookup
+
+    def risk_for(self, tool_name: str) -> str:
+        if self.risk_lookup is not None:
+            return self.risk_lookup(tool_name)
+        if tool_name in ESCALATED_TOOLS:
+            return RISK_ESCALATE
+        if tool_name in WRITE_TOOLS:
+            return RISK_WRITE
+        return RISK_READ
 
     def authorize_with_context(
         self,
@@ -109,8 +127,10 @@ class PermissionPolicy:
         if self.mode in (PermissionMode.ALLOW, PermissionMode.DANGER_FULL_ACCESS):
             return PermissionOutcome.Allow()
 
+        risk = self.risk_for(tool_name)
+
         if self.mode is PermissionMode.READ_ONLY:
-            if tool_name in WRITE_TOOLS:
+            if risk != RISK_READ:
                 return PermissionOutcome.Deny(
                     f"`{tool_name}` mutates state and the session is read-only"
                 )
@@ -120,10 +140,13 @@ class PermissionPolicy:
             return self._escalate(tool_name, effective_input, prompter)
 
         # workspace-write
-        if tool_name in ESCALATED_TOOLS:
+        if risk == RISK_ESCALATE:
             return self._escalate(tool_name, effective_input, prompter)
-        if tool_name in WRITE_TOOLS:
+        if risk == RISK_WRITE:
             target = effective_input.get("path", "")
+            # A write tool with no path argument cannot be workspace-checked.
+            if not target:
+                return PermissionOutcome.Allow()
             if not self._inside_workspace(target):
                 return PermissionOutcome.Deny(
                     f"`{target}` is outside the workspace root {self.workspace_root}"

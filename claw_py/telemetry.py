@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Any, Optional, TextIO
@@ -20,6 +21,7 @@ class SessionTracer:
         self.echo = echo
         self._handle: Optional[TextIO] = None
         self._owns_handle = False
+        self._lock = threading.Lock()  # workers emit concurrently
         if path is not None:
             path.parent.mkdir(parents=True, exist_ok=True)
             self._handle = path.open("a")
@@ -32,6 +34,7 @@ class SessionTracer:
         clone.echo = self.echo
         clone._handle = self._handle
         clone._owns_handle = False
+        clone._lock = self._lock  # one lock guards the shared sink
         return clone
 
     def emit(self, kind: str, **fields: Any) -> None:
@@ -42,11 +45,12 @@ class SessionTracer:
             **fields,
         }
         line = json.dumps(event)
-        if self._handle is not None:
-            self._handle.write(line + "\n")
-            self._handle.flush()
-        if self.echo:
-            print(f"    · {line}", file=sys.stderr)
+        with self._lock:
+            if self._handle is not None:
+                self._handle.write(line + "\n")
+                self._handle.flush()
+            if self.echo:
+                print(f"    · {line}", file=sys.stderr)
 
     def close(self) -> None:
         if self._handle is not None and self._owns_handle:
