@@ -24,8 +24,10 @@ Every section names the Python file in this repo and the Rust file in
 - [Stage 10 — Loop back](#stage-10--loop-back)
 - [Stage 11 — Turn summary](#stage-11--turn-summary)
 - [Cross-cutting: tracing and replay](#cross-cutting-tracing-and-replay)
+- [Subagents](#subagents)
+- [Multi-provider routing](#multi-provider-routing)
 - [Three design decisions worth stealing](#three-design-decisions-worth-stealing)
-- [Extending it](#extending-it)
+- [Still missing](#still-missing)
 
 ---
 
@@ -472,66 +474,264 @@ into other systems. It costs almost nothing and it's very hard to retrofit.
 
 ---
 
-## Three design decisions worth stealing
+## Subagents
 
-**1. Failure is data, not control flow.** Tool errors and permission denials both
-become tool results with `is_error: true`. The model reads them and adapts. Only
-the iteration cap and provider failures abort a turn. This single choice is what
-lets an agent operate under a restrictive policy without a human babysitting it.
+**Python:** `claw_py/agents.py`
+**Rust:** `execute_agent` / `allowed_tools_for_subagent` in `tools/src/lib.rs`
 
-**2. One choke point for every tool.** Built-ins, plugins, MCP-bridged tools, and
-subagents all pass through the same hook → permission → execute → hook pipeline.
-Adding a capability cannot accidentally add a bypass, because there is only one
-path.
+A subagent is **not a special mechanism**. It is an ordinary tool, registered in
+the same `ToolExecutor`, gated by the same hooks and the same policy. Its handler
+just happens to build a nested `ConversationRuntime`.
 
-**3. Trace at the point of action.** Emitting structured events inline — rather
-than logging and reconstructing later — makes replay a property of the system
-rather than a project.
+That framing is the whole design. Because delegation is a tool, it cannot bypass
+anything — the gate in Stage 6-9 applies to `agent` exactly as it applies to
+`bash`.
 
-And one to be careful about: **hooks outrank the permission policy in both
-directions.** That's a powerful escape hatch and a real risk surface. Whatever
-configures hooks is as trusted as the harness itself.
+### Why delegate at all
+
+Look at what the demo prints:
+
+```
+ok  agent   [explore-1a4d6d] map the package (4 iteration(s), 3 tool call(s))
+
+INSIDE THE SUBAGENTS (from the trace)
+  explore-1a4d6d  spawned at depth 1  tools=glob_search,grep_search,read_file
+  explore-1a4d6d  ok     glob_search
+  explore-1a4d6d  ok     read_file
+  explore-1a4d6d  ok     grep_search
+```
+
+The subagent ran four iterations and three tool calls. The parent's history grew
+by **one tool result containing one paragraph**.
+
+That is the entire economic argument for subagents. Recall from Stage 2 that the
+full history is re-sent on every iteration — so an exploration that costs 3 tool
+results in the parent costs those 3 results *on every subsequent request for the
+rest of the session*. Push it into a subagent and you pay for it once, inside a
+context window you then throw away.
+
+### The five guarantees
+
+```python
+runtime = ConversationRuntime(
+    api_client=config.client_factory(config.subagent_model),
+    tool_executor=tool_executor,
+    permission_policy=PermissionPolicy(
+        mode=narrower_mode(config.parent_mode, spec.mode),   # 2
+        workspace_root=config.workspace_root,
+        allowed_tools=allowed_tools,                          # 1
+    ),
+    system_prompt=build_agent_system_prompt(...),
+    session=Session(session_id=agent_id),                     # 4
+    hook_registry=config.hook_registry,                       # 3
+    session_tracer=tracer,
+    max_iterations=spec.max_iterations,                       # 5
+)
+summary = runtime.run_turn(prompt, prompter=None)             # 6
+```
+
+**1. Restricted tools, enforced twice.** The allowlist goes into
+`PermissionPolicy(allowed_tools=...)` *and* filters what is offered to the model
+via `wire_specs(offered)`. The model is not tempted by a tool it cannot use, and
+if it calls one anyway the policy refuses. Belt and braces, deliberately — a
+small model will invent tool names.
+
+**2. A subagent never gains authority.** `narrower_mode` takes the minimum of the
+parent's mode and the spec's:
+
+```python
+MODE_RANK = {READ_ONLY: 0, PROMPT: 1, WORKSPACE_WRITE: 2, ALLOW: 3, DANGER_FULL_ACCESS: 4}
+```
+
+A `verification` agent wants `workspace-write`, but if the parent is `read-only`
+it gets `read-only`. Authority only ever narrows going down the tree.
+
+**3. Hooks are inherited, not reset.** The subagent gets the parent's
+`HookRegistry`. A hook that blocks `rm -rf` at the top blocks it three levels
+down. If subagents got a fresh registry, delegation would be a privilege
+escalation path.
+
+**4. A fresh `Session`.** This is what produces the isolation in the demo.
+
+**5. A lower iteration cap, and no human.** `spec.max_iterations` is per-type
+(8-12). And `prompter=None` — a subagent **cannot escalate to the user**, because
+there is nobody watching it. Any tool needing approval is denied. The system
+prompt says so explicitly, so the model does not waste turns asking.
+
+### The five types
+
+| Type | Tools | Mode | For |
+|---|---|---|---|
+| `explore` | read, glob, grep | `read-only` | Searching a codebase |
+| `plan` | read, glob, grep, todo | `read-only` | Turning a goal into steps |
+| `verification` | read, glob, grep, bash | `workspace-write` | Checking a claim holds |
+| `general-purpose` | everything | `workspace-write` | Self-contained tasks |
+
+`normalize_subagent_type` accepts aliases and casing (`Explorer` → `explore`,
+`general_purpose` → `general-purpose`) because small models are inconsistent
+about enum values, and rejects anything unrecognised with a `ToolError` listing
+the valid options — which the model reads and corrects on its next iteration.
+
+### Depth limiting
+
+The `agent` tool is simply **not registered** at the ceiling:
+
+```python
+def build_tool_executor(config: AgentConfig, depth: int) -> ToolExecutor:
+    executor = default_tool_executor()
+    if depth < config.max_depth:
+        executor.register(make_agent_tool(config, depth + 1))
+    return executor
+```
+
+Structural rather than checked: at max depth the tool does not exist, so it
+cannot be called. `execute_agent` also checks depth defensively, in case a tool
+is registered by another path. `--max-agent-depth 0` disables delegation
+entirely.
+
+### Failure containment
+
+```python
+try:
+    summary = runtime.run_turn(prompt, prompter=None)
+except Exception as error:
+    tracer.emit("subagent_failed", depth=depth, error=str(error))
+    raise ToolError(f"subagent `{agent_id}` failed: {error}") from error
+```
+
+A subagent blowing its iteration cap raises `RuntimeError` internally — but that
+is caught and re-raised as `ToolError`, which Stage 8 converts into an
+`is_error` tool result. **A failed subagent does not fail the parent's turn.**
+The parent reads "subagent explore-6f4c6e failed: exceeded the maximum number of
+iterations" and decides what to do next. This is Stage 8's failure-is-data rule
+applied recursively.
 
 ---
 
-## Extending it
+## Multi-provider routing
 
-Both of these are small precisely because Stage 8 is a single choke point.
+**Python:** `claw_py/routing.py`
 
-### Subagents (~40 lines)
+`RoutedApiClient` is a **drop-in replacement for `ApiClient`**. Same `stream()`
+contract, same four event types. Nothing above it knows which provider answered.
 
-Register an `agent` tool whose handler constructs a fresh `ConversationRuntime`:
-
-```python
-def execute_agent(input):
-    subagent_type = input.get("subagent_type", "general-purpose")
-    runtime = ConversationRuntime(
-        api_client=ApiClient(model=...),
-        tool_executor=default_tool_executor(),
-        permission_policy=PermissionPolicy(
-            mode=PermissionMode.READ_ONLY,
-            allowed_tools=allowed_tools_for_subagent(subagent_type),
-        ),
-        system_prompt=build_agent_system_prompt(subagent_type),
-        max_iterations=8,
-    )
-    return runtime.run_turn(input["prompt"]).assistant_messages[-1].text()
+```bash
+pip install litellm
+python -m claw_py.cli --router litellm --model local-fast "..."
 ```
 
-The original ships five types — general-purpose, explore, plan, verification, and
-clawguide — each with its own prompt and restricted `allowed_tools` set. Depth
-limiting is the only real subtlety: without it, an agent can spawn agents that
-spawn agents.
+### Roles, not models
+
+```python
+DEFAULT_ROUTES = {
+    "local-fast": [Route("ollama/qwen3:4b", api_base="..."),
+                   Route("ollama/llama3.1:8b", api_base="...")],
+    "local-deep": [Route("ollama/qwen3:14b", api_base="..."), ...],
+    "frontier":   [Route("anthropic/claude-sonnet-4-6"),
+                   Route("openai/gpt-4.1")],
+}
+```
+
+A caller asks for `local-fast`, not for a model. Each role is an **ordered
+fallback chain**; `stream()` walks it and only raises once every route has
+failed, with all the errors collected:
+
+```
+every route for `frontier` failed:
+  anthropic/claude-sonnet-4-6: <error>
+  openai/gpt-4.1: <error>
+```
+
+### Where it earns its keep
+
+Because `AgentConfig.client_factory` is what builds every runtime, parent and
+subagents can sit on different tiers:
+
+```bash
+python -m claw_py.cli --router litellm --model frontier --subagent-model local-fast
+```
+
+A strong model plans and decides; a cheap local one does the grepping. That
+combination is the usual reason to want routing, and here it is one flag —
+because `execute_agent` calls `config.client_factory(config.subagent_model)`
+rather than constructing a client itself.
+
+### The fiddly part
+
+Streaming tool calls arrive **fragmented**. The function name comes in one chunk,
+the JSON arguments dribble across several, and parallel calls interleave:
+
+```
+chunk 1: tool_calls[0] id=call_a name=read_file arguments='{"pa'
+chunk 2: tool_calls[0]                          arguments='th": "alpha'
+chunk 3: tool_calls[1] id=call_b name=grep      arguments='{"pattern"'
+chunk 4: tool_calls[0]                          arguments='.py"}'
+```
+
+`_decode` accumulates by `index` and emits each call only once the stream ends:
+
+```python
+slot = pending.setdefault(index, {"id": "", "name": "", "arguments": ""})
+if function.name:      slot["name"] = function.name
+if function.arguments: slot["arguments"] += function.arguments
+```
+
+Malformed JSON becomes `{"_raw": ...}` rather than raising — the tool then fails
+schema validation and the model gets told, which is the right failure mode for a
+small model that emits broken arguments. Tests in `tests/test_agents.py` cover
+all of this without needing litellm installed.
+
+---
+
+## Three design decisions worth stealing
+
+**1. Failure is data, not control flow.** Tool errors, permission denials, and
+crashed subagents all become tool results with `is_error: true`. The model reads
+them and adapts. Only the iteration cap and provider failures abort a turn. This
+single choice is what lets an agent operate under a restrictive policy without a
+human babysitting it.
+
+**2. One choke point for every tool.** Built-ins, subagents, and (were they
+implemented) MCP-bridged tools all pass through the same hook → permission →
+execute → hook pipeline. Adding a capability cannot accidentally add a bypass,
+because there is only one path. Delegation being *a tool* rather than a runtime
+feature is the sharpest example.
+
+**3. Trace at the point of action.** Emitting structured events inline — rather
+than logging and reconstructing later — makes replay a property of the system
+rather than a project. With subagents this pays double: the parent's trace and
+every subagent's trace share one file, distinguished by `session_id` and
+`depth`, so a whole delegation tree is one grep away.
+
+And one to be careful about: **hooks outrank the permission policy in both
+directions**, and they are inherited by subagents. That is correct — it is what
+stops delegation being an escalation path — but it means whatever configures
+hooks is as trusted as the harness itself.
+
+---
+
+## Still missing
 
 ### MCP tools
 
-Anything producing a `ToolSpec` can be handed to `ToolExecutor.register()`.
-Bridged tools then inherit the identical hook and permission path as the
-built-ins — which is exactly the property you want, since remote tools are the
-ones you least want bypassing your gates.
+Anything producing a `ToolSpec` can be handed to `ToolExecutor.register()`, or
+passed as `AgentConfig.extra_tools` so subagents get it too. Bridged tools then
+inherit the identical hook and permission path as the built-ins — exactly what
+you want, since remote tools are the ones you least want bypassing your gates.
 
-### Multi-provider routing
+The work is in the transport, not the integration: an MCP stdio client, schema
+translation, and server lifecycle. In the Rust original that is about 3,000
+lines, and almost none of it is architecture.
 
-`ApiClient` is one class with one `stream()` method. Swapping in a router that
-fans across local and hosted models is a drop-in replacement — nothing above it
-in the stack knows or cares which model answered.
+### Session persistence and resume
+
+`Session.fork_session` copies in memory but nothing writes to disk. Since the
+trace already contains every event, resume could be built by replaying the JSONL
+rather than by serialising session state — which would be a better design than
+the original's.
+
+### Parallel tool dispatch
+
+Stage 8 runs pending calls sequentially. Independent calls could run
+concurrently, though the permission prompt and hook ordering both need thought
+before that is safe.

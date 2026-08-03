@@ -10,7 +10,8 @@ validation. **This repository strips all of it out and keeps only the
 architecture**: the turn loop, the three-layer tool-gating pipeline, context
 compaction, and inline tracing.
 
-About 1,800 lines. Standard library only — no `pip install` required.
+About 2,600 lines. Standard library only — no `pip install` required.
+Optional: `litellm`, if you want multi-provider routing.
 
 ---
 
@@ -112,15 +113,62 @@ memory. Anything below ~4B tends to emit malformed tool arguments or never stop
 calling tools — which is itself a live demonstration of why `max_iterations`
 exists.
 
-### 3. Run the tests
+### 3. Watch a subagent get delegated to
+
+```bash
+python examples/demo_subagents.py
+```
+
+Also offline. A parent agent delegates twice to an `explore` subagent:
+
+```
+PARENT
+  iterations       : 3
+  tool results     : 2
+  session messages : 6
+
+ok  agent   [explore-1a4d6d] map the package (4 iteration(s), 3 tool call(s)) ...
+
+INSIDE THE SUBAGENTS (from the trace)
+  explore-1a4d6d  spawned at depth 1  tools=glob_search,grep_search,read_file
+  explore-1a4d6d  ok     glob_search
+  explore-1a4d6d  ok     read_file
+  explore-1a4d6d  ok     grep_search
+  explore-6f4c6e  DENIED write_file
+
+DEPTH LIMIT
+  tools at depth 0 : True
+  tools at depth 1 : False   (max_depth=1)
+```
+
+Four properties in one run: the subagent's three tool results **never entered the
+parent's context** (only its final paragraph did), `write_file` was **denied even
+though the parent runs in `workspace-write`**, the parent's hooks **still gated
+the subagent**, and the `agent` tool **was not registered at all** at the depth
+ceiling.
+
+### 4. Route across providers
+
+```bash
+pip install litellm
+python -m claw_py.cli --router litellm --model local-fast --subagent-model local-fast "..."
+```
+
+You ask for a *role* (`local-fast`, `local-deep`, `frontier`), not a model. Each
+role carries an ordered fallback chain. See
+[ARCHITECTURE.md](ARCHITECTURE.md#multi-provider-routing).
+
+### 5. Run the tests
 
 ```bash
 python -m unittest discover -s tests -v
 ```
 
-27 tests, no network. They cover the loop, the iteration cap, tool failures,
-all five permission modes, hook rewrite/deny/override, post-hook error flipping,
-compaction, and the session health probe.
+54 tests, no network, no model. They cover the loop, the iteration cap, tool
+failures, all five permission modes, hook rewrite/deny/override, post-hook error
+flipping, compaction, the session health probe, subagent tool restriction, mode
+narrowing, depth limiting, hook inheritance, context isolation, and the router's
+fragmented-tool-call reassembly.
 
 ---
 
@@ -140,13 +188,17 @@ claw-py/
 │   ├── permissions.py      modes, policy, outcomes, prompter
 │   ├── hooks.py            lifecycle hooks and feedback merging
 │   ├── compact.py          token estimation and history rewriting
+│   ├── agents.py           subagents: the agent tool, restriction, depth
+│   ├── routing.py          optional LiteLLM multi-provider router
 │   ├── prompt.py           system prompt assembly
 │   ├── telemetry.py        inline trace events
 │   └── cli.py              REPL, one-shot mode, demo hooks
 ├── examples/
-│   └── demo_offline.py     scripted run, no model needed
+│   ├── demo_offline.py     the gating pipeline, no model needed
+│   └── demo_subagents.py   delegation and isolation, no model needed
 └── tests/
-    └── test_loop.py        27 tests
+    ├── test_loop.py        the loop, gating, compaction
+    └── test_agents.py      subagents and routing
 ```
 
 **If you read one file, read `claw_py/conversation.py`.** Everything else is a
@@ -168,15 +220,19 @@ Names match the Rust originals wherever Python allows it.
 | `hooks.py` → `HookEvent`, `merge_hook_feedback` | `runtime/src/hooks.rs` |
 | `compact.py` → `should_compact`, `compact_session` | `runtime/src/compact.rs` |
 | `prompt.py` → `build_system_prompt` | `runtime/src/prompt.rs` |
+| `agents.py` → `execute_agent`, `allowed_tools_for_subagent` | `tools/src/lib.rs` |
+| `routing.py` → `RoutedApiClient` | (no direct analogue — replaces `api/src/providers/`) |
 | `telemetry.py` → `SessionTracer` | `telemetry/src/lib.rs` |
 | `cli.py` | `rusty-claude-cli` |
 
 Preserved verbatim: `run_turn`, `pending_tool_uses`, `effective_input`,
 `PermissionOutcome.Allow/Deny`, `authorize_with_context`, `permission_override`,
 `merge_hook_feedback`, `format_hook_message`, `maybe_auto_compact`,
-`build_assistant_message`, `ConversationMessage.tool_result`, `TurnSummary`, and
-the full `record_*` trace family. `PermissionMode` and `HookEvent` keep their
-exact string values (`workspace-write`, `PreToolUse`).
+`build_assistant_message`, `ConversationMessage.tool_result`, `TurnSummary`,
+`execute_agent`, `normalize_subagent_type`, `allowed_tools_for_subagent`,
+`build_agent_system_prompt`, and the full `record_*` trace family.
+`PermissionMode` and `HookEvent` keep their exact string values
+(`workspace-write`, `PreToolUse`).
 
 ---
 
@@ -189,9 +245,10 @@ These are cuts, not oversights. Each is a place the original does more.
 - **Token estimation is `len(chars) // 4`**, not a real tokeniser.
 - **No session persistence, resume, or fork-to-disk.** `Session.fork_session`
   exists but only copies in memory.
-- **No MCP client and no subagents.** Both are sketched in
-  [ARCHITECTURE.md](ARCHITECTURE.md#extending-it) — each is a small addition
-  precisely because the tool pipeline is the single choke point.
+- **No MCP client.** Sketched in [ARCHITECTURE.md](ARCHITECTURE.md#mcp-tools) —
+  a small addition precisely because the tool pipeline is one choke point.
+- **Subagents run sequentially and share one workspace.** A production harness
+  would sandbox each one and may run them in parallel.
 - **`types.RuntimeError` deliberately shadows the builtin** inside this package
   to match the Rust name. It is imported explicitly everywhere it is used.
 

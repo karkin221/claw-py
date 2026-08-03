@@ -11,6 +11,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from .agents import AGENT_SPECS, AgentConfig, build_tool_executor
 from .api import DEFAULT_BASE_URL, DEFAULT_MODEL, ApiClient
 from .compact import CompactionConfig
 from .conversation import ConversationRuntime
@@ -74,24 +75,48 @@ def default_hook_registry() -> HookRegistry:
 
 def build_runtime(args: argparse.Namespace) -> ConversationRuntime:
     cwd = Path(args.cwd).expanduser().resolve()
-    tool_executor = default_tool_executor()
-    system_prompt, memory_files = build_system_prompt(cwd, tool_executor.names())
-
-    api_client = ApiClient(
-        model=args.model,
-        base_url=args.base_url,
-        tool_specs=tool_executor.wire_specs(),
-    )
-    permission_policy = PermissionPolicy(
-        mode=PermissionMode.from_str(args.permission_mode),
-        workspace_root=cwd,
-    )
+    permission_mode = PermissionMode.from_str(args.permission_mode)
     session = Session()
     session_tracer = SessionTracer(
         session.session_id,
         path=Path(args.trace) if args.trace else None,
         echo=args.verbose,
     )
+    hook_registry = default_hook_registry()
+
+    def announce_route(role: str, model: str, attempt: int) -> None:
+        if attempt > 0:
+            print(f"  route `{role}` fell back to {model}", file=sys.stderr)
+
+    # One factory, so parent and subagents are built the same way.
+    if args.router == "litellm":
+        from .routing import routed_client_factory
+
+        client_factory = routed_client_factory(args.model, on_route=announce_route)
+    else:
+        def client_factory(model: str) -> ApiClient:
+            return ApiClient(model=model or args.model, base_url=args.base_url)
+
+    if args.no_subagents:
+        tool_executor = default_tool_executor()
+    else:
+        agent_config = AgentConfig(
+            client_factory=client_factory,
+            workspace_root=cwd,
+            hook_registry=hook_registry,
+            session_tracer=session_tracer,
+            parent_mode=permission_mode,
+            subagent_model=args.subagent_model or args.model,
+            max_depth=args.max_agent_depth,
+        )
+        tool_executor = build_tool_executor(agent_config, depth=0)
+
+    system_prompt, memory_files = build_system_prompt(cwd, tool_executor.names())
+
+    api_client = client_factory(args.model)
+    api_client.tool_specs = tool_executor.wire_specs()
+
+    permission_policy = PermissionPolicy(mode=permission_mode, workspace_root=cwd)
 
     if memory_files:
         loaded = ", ".join(str(m.path.name) for m in memory_files)
@@ -103,7 +128,7 @@ def build_runtime(args: argparse.Namespace) -> ConversationRuntime:
         permission_policy=permission_policy,
         system_prompt=system_prompt,
         session=session,
-        hook_registry=default_hook_registry(),
+        hook_registry=hook_registry,
         session_tracer=session_tracer,
         max_iterations=args.max_iterations,
         compaction_config=CompactionConfig(threshold_tokens=args.compact_threshold),
@@ -138,6 +163,26 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--max-iterations", type=int, default=12)
     parser.add_argument("--compact-threshold", type=int, default=3000)
     parser.add_argument("--trace", default=None, help="write JSONL trace to this path")
+    parser.add_argument(
+        "--router",
+        default="ollama",
+        choices=["ollama", "litellm"],
+        help="ollama: stdlib client. litellm: route across providers by role name.",
+    )
+    parser.add_argument(
+        "--subagent-model",
+        default=None,
+        help="model (or litellm role) for subagents; defaults to --model",
+    )
+    parser.add_argument(
+        "--max-agent-depth",
+        type=int,
+        default=2,
+        help="how deep subagents may nest; 0 disables the agent tool",
+    )
+    parser.add_argument(
+        "--no-subagents", action="store_true", help="do not register the agent tool"
+    )
     parser.add_argument("-v", "--verbose", action="store_true", help="echo trace events")
     args = parser.parse_args(argv)
 
@@ -153,7 +198,10 @@ def main(argv: list[str] | None = None) -> int:
         render_summary(runtime, summary)
         return 0
 
-    print(f"claw-py · {args.model} · {args.permission_mode} · ctrl-d to exit")
+    banner = f"claw-py · {args.model} · {args.permission_mode}"
+    if not args.no_subagents and args.max_agent_depth > 0:
+        banner += f" · subagents: {', '.join(sorted(AGENT_SPECS))}"
+    print(f"{banner} · ctrl-d to exit")
     while True:
         try:
             user_input = input("\n> ").strip()

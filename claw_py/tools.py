@@ -14,7 +14,7 @@ import re
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Optional
 
 MAX_OUTPUT_CHARS = 4000
 
@@ -53,8 +53,13 @@ class ToolExecutor:
     def names(self) -> list[str]:
         return sorted(self._specs)
 
-    def wire_specs(self) -> list[dict[str, Any]]:
-        return [spec.to_wire() for spec in self._specs.values()]
+    def wire_specs(self, names: Optional[set[str]] = None) -> list[dict[str, Any]]:
+        """Schemas sent to the model. Filter by `names` to restrict a subagent."""
+        return [
+            spec.to_wire()
+            for spec in self._specs.values()
+            if names is None or spec.name in names
+        ]
 
     def execute(self, tool_name: str, effective_input: dict[str, Any]) -> str:
         spec = self._specs.get(tool_name)

@@ -19,9 +19,20 @@ class SessionTracer:
         self.session_id = session_id
         self.echo = echo
         self._handle: Optional[TextIO] = None
+        self._owns_handle = False
         if path is not None:
             path.parent.mkdir(parents=True, exist_ok=True)
             self._handle = path.open("a")
+            self._owns_handle = True
+
+    def child(self, session_id: str) -> "SessionTracer":
+        """A tracer for a nested runtime, writing to the same sink."""
+        clone = SessionTracer.__new__(SessionTracer)
+        clone.session_id = session_id
+        clone.echo = self.echo
+        clone._handle = self._handle
+        clone._owns_handle = False
+        return clone
 
     def emit(self, kind: str, **fields: Any) -> None:
         event = {
@@ -38,6 +49,6 @@ class SessionTracer:
             print(f"    · {line}", file=sys.stderr)
 
     def close(self) -> None:
-        if self._handle is not None:
+        if self._handle is not None and self._owns_handle:
             self._handle.close()
-            self._handle = None
+        self._handle = None
