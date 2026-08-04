@@ -293,7 +293,7 @@ class ConversationRuntime:
 
     def _execute_tool_plan(self, iterations: int, plan: ToolPlan) -> tuple[str, bool]:
         """The parallel-safe part: run the tool, capture failure as data."""
-        self.record_tool_started(iterations, plan.tool_name)
+        self.record_tool_started(iterations, plan.tool_name, plan.tool_use_id)
         try:
             output = self.tool_executor.execute(plan.tool_name, plan.effective_input)
             is_error = False
@@ -429,9 +429,14 @@ class ConversationRuntime:
             "parallel_batch", iteration=iterations, tools=sorted(tool_names)
         )
 
-    def record_tool_started(self, iterations: int, tool_name: str) -> None:
+    def record_tool_started(
+        self, iterations: int, tool_name: str, tool_use_id: str = ""
+    ) -> None:
         self.session_tracer.emit(
-            "tool_started", iteration=iterations, tool_name=tool_name
+            "tool_started",
+            iteration=iterations,
+            tool_name=tool_name,
+            tool_use_id=tool_use_id,
         )
 
     def record_tool_finished(
@@ -441,6 +446,7 @@ class ConversationRuntime:
             "tool_finished",
             iteration=iterations,
             tool_name=result_message.tool_name,
+            tool_use_id=result_message.tool_use_id,
             is_error=result_message.is_error,
             output_chars=len(result_message.text()),
         )

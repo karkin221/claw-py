@@ -34,6 +34,18 @@ class ApiClient:
         self.base_url = base_url.rstrip("/")
         self.tool_specs = tool_specs or []
         self.temperature = temperature
+        self._call_counter = 0
+
+    def next_call_id(self) -> str:
+        """Monotonic across the client's lifetime, not per-stream.
+
+        A per-stream counter restarts at 1 every iteration, so two tool calls in
+        one turn can share `call_1`. That makes tool_use ids useless for joining
+        a result back to its request in the trace, and would break any provider
+        that correlates by id.
+        """
+        self._call_counter = getattr(self, "_call_counter", 0) + 1
+        return f"call_{self._call_counter}"
 
     def stream(self, request: ApiRequest) -> Iterator[dict[str, Any]]:
         """Yield provider events.
@@ -71,7 +83,6 @@ class ApiClient:
             ) from error
 
     def _decode(self, response: Any) -> Iterator[dict[str, Any]]:
-        call_index = 0
         for raw in response:
             line = raw.decode().strip()
             if not line:
@@ -91,10 +102,9 @@ class ApiClient:
                         arguments = json.loads(arguments)
                     except json.JSONDecodeError:
                         arguments = {"_raw": arguments}
-                call_index += 1
                 yield {
                     "type": "tool_use",
-                    "id": f"call_{call_index}",
+                    "id": self.next_call_id(),
                     "name": function.get("name", ""),
                     "input": arguments,
                 }

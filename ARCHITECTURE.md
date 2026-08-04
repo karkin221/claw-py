@@ -183,10 +183,18 @@ within them.
 Three functions:
 
 ```python
-estimate_session_tokens(session)   # len(chars) // 4 — cheap, good enough
+estimate_session_tokens(session)   # wire chars // 4 — cheap, good enough
 should_compact(session, config)    # compare against threshold
 compact_session(session, config, summarize)
 ```
+
+The estimate is measured from `to_wire()`, not from `text()` — a subtle but
+important distinction. A `tool_use` block carries its arguments in
+`block.input`, which `text()` cannot see but which is serialised into
+`tool_calls` and re-sent on every subsequent request. Counting text alone
+undercounted a real file-writing session by about 6x (114 estimated tokens
+against a ~660-token payload), so the threshold never tripped on exactly the
+workload that grows history fastest.
 
 `compact_session` splits the history, asks the model to summarise the older
 portion, and replaces it with that summary plus a continuation message. It never
@@ -942,5 +950,6 @@ filesystem. Isolating each one is the obvious next safety step.
 Running independent explorations concurrently is the biggest remaining
 throughput win, and the phase split already makes it structurally possible.
 
-**A real tokeniser.** `len(chars) // 4` drives compaction. Fine for a threshold,
-wrong for anything you would bill on.
+**A real tokeniser.** `chars // 4` over the wire payload drives compaction. The
+shape is now right — it measures what is actually sent — but it is still a
+heuristic. Fine for a threshold, wrong for anything you would bill on.

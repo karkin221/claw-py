@@ -542,3 +542,134 @@ class ParallelDispatchTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ---------------------------------------------------------------------------
+# regressions found by reading a real trace
+# ---------------------------------------------------------------------------
+
+
+class TokenEstimateTests(unittest.TestCase):
+    """estimate_session_tokens counted text() only, missing tool_use inputs.
+
+    A file-writing session was undercounted ~6x, so auto-compaction never fired
+    on exactly the workload that grows history fastest.
+    """
+
+    def _session_with_a_written_file(self, content_chars: int = 1659) -> Session:
+        session = Session()
+        session.push_user_text("write me a game")
+        session.push_message(
+            ConversationMessage(
+                role="assistant",
+                blocks=[
+                    ContentBlock.tool_use(
+                        "call_1", "write_file", {"path": "g.py", "content": "x" * content_chars}
+                    )
+                ],
+            )
+        )
+        session.push_message(
+            ConversationMessage.tool_result("call_1", "write_file", "wrote it", False)
+        )
+        return session
+
+    def test_tool_use_arguments_are_counted(self) -> None:
+        from claw_py.compact import estimate_session_tokens
+
+        session = self._session_with_a_written_file()
+        # text() sees ~35 chars; the wire payload is over 1600.
+        self.assertGreater(estimate_session_tokens(session), 400)
+
+    def test_estimate_tracks_the_actual_wire_payload(self) -> None:
+        import json as _json
+
+        from claw_py.compact import CHARS_PER_TOKEN, estimate_session_tokens
+
+        session = self._session_with_a_written_file()
+        wire = sum(
+            len(_json.dumps(m.to_wire(), ensure_ascii=False)) for m in session.messages
+        )
+        self.assertEqual(estimate_session_tokens(session), wire // CHARS_PER_TOKEN)
+
+    def test_bigger_file_means_bigger_estimate(self) -> None:
+        from claw_py.compact import estimate_session_tokens
+
+        small = estimate_session_tokens(self._session_with_a_written_file(100))
+        large = estimate_session_tokens(self._session_with_a_written_file(8000))
+        self.assertGreater(large - small, 1500)
+
+    def test_compaction_now_fires_on_a_file_writing_session(self) -> None:
+        from claw_py.compact import CompactionConfig, should_compact
+
+        session = self._session_with_a_written_file(8000)
+        session.push_user_text("now run it")
+        session.push_message(ConversationMessage(role="assistant", blocks=[]))
+        session.push_user_text("and again")
+        session.push_message(ConversationMessage(role="assistant", blocks=[]))
+        config = CompactionConfig(threshold_tokens=1000, keep_last=4)
+        self.assertTrue(should_compact(session, config))
+
+        # The same session measured the old way stays under the threshold,
+        # which is exactly why this never fired before.
+        old_estimate = sum(len(m.text()) for m in session.messages) // 4
+        self.assertLess(old_estimate, 1000)
+
+
+class CallIdTests(unittest.TestCase):
+    """Tool-use ids restarted at call_1 every stream, so they collided."""
+
+    class _Chunks:
+        def __init__(self, calls) -> None:
+            self.calls = calls
+
+        def __iter__(self):
+            import json as _json
+
+            for name, args in self.calls:
+                yield _json.dumps(
+                    {"message": {"tool_calls": [{"function": {"name": name, "arguments": args}}]}}
+                ).encode()
+            yield b'{"done": true, "prompt_eval_count": 1, "eval_count": 1}'
+
+    def test_ids_are_unique_across_streams(self) -> None:
+        from claw_py.api import ApiClient
+
+        client = ApiClient()
+        first = [e["id"] for e in client._decode(self._Chunks([("read_file", {})])) if e["type"] == "tool_use"]
+        second = [e["id"] for e in client._decode(self._Chunks([("bash", {})])) if e["type"] == "tool_use"]
+        self.assertEqual(first, ["call_1"])
+        self.assertEqual(second, ["call_2"])  # not call_1 again
+
+    def test_ids_are_unique_within_a_stream(self) -> None:
+        from claw_py.api import ApiClient
+
+        client = ApiClient()
+        ids = [
+            e["id"]
+            for e in client._decode(self._Chunks([("read_file", {}), ("bash", {})]))
+            if e["type"] == "tool_use"
+        ]
+        self.assertEqual(len(set(ids)), 2)
+
+    def test_trace_events_carry_the_tool_use_id(self) -> None:
+        workspace = Path(tempfile.mkdtemp(prefix="claw-py-ids-"))
+        (workspace / "a.txt").write_text("x\n")
+        sink: list = []
+
+        class Collecting(SessionTracer):
+            def emit(self, kind, **fields):
+                sink.append({"kind": kind, **fields})
+
+        session = Session()
+        runtime = make_runtime(
+            [[("read_file", {"path": str(workspace / "a.txt")})], []],
+            workspace,
+            session=session,
+            tracer=Collecting(session.session_id),
+        )
+        runtime.run_turn("read it")
+        started = [e for e in sink if e["kind"] == "tool_started"][0]
+        finished = [e for e in sink if e["kind"] == "tool_finished"][0]
+        self.assertTrue(started["tool_use_id"])
+        self.assertEqual(started["tool_use_id"], finished["tool_use_id"])

@@ -202,13 +202,14 @@ python -m claw_py.cli --trace t.jsonl --resume a1b2c3 "..." # resume by id
 python -m unittest discover -s tests -v
 ```
 
-91 tests, no network, no model. They cover the loop, the iteration cap, tool
+98 tests, no network, no model. They cover the loop, the iteration cap, tool
 failures, all five permission modes, hook rewrite/deny/override, post-hook error
 flipping, compaction, the session health probe, subagent tool restriction, mode
 narrowing, depth limiting, hook inheritance, context isolation, the router's
 fragmented-tool-call reassembly, MCP handshake/dispatch/concurrency against a
 real subprocess, trace replay including compaction and truncated writes, and
-parallel dispatch ordering guarantees.
+parallel dispatch ordering guarantees, and two regressions found by reading a
+real production trace (see the commit log).
 
 ---
 
@@ -289,7 +290,8 @@ These are cuts, not oversights. Each is a place the original does more.
 
 - **Tool calls run sequentially.** So does the Rust original — but a production
   harness would dispatch independent calls concurrently.
-- **Token estimation is `len(chars) // 4`**, not a real tokeniser.
+- **Token estimation is `chars // 4`** of the serialised wire payload, not a
+  real tokeniser. The shape is right; the precision is not.
 - **No session persistence, resume, or fork-to-disk.** `Session.fork_session`
   exists but only copies in memory.
 - **Subagents run sequentially and share one workspace.** A production harness

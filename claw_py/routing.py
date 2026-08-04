@@ -81,6 +81,7 @@ class RoutedApiClient(ApiClient):
         self.tool_specs = tool_specs or []
         self.temperature = temperature
         self.on_route = on_route
+        self._call_counter = 0
         # `model` is exposed for display and for anything that reads it.
         self.model = self.routes[role][0].model
 
@@ -167,7 +168,7 @@ class RoutedApiClient(ApiClient):
                 continue
             yield {
                 "type": "tool_use",
-                "id": slot["id"] or f"call_{index + 1}",
+                "id": slot["id"] or self.next_call_id(),
                 "name": slot["name"],
                 "input": _parse_arguments(slot["arguments"]),
             }

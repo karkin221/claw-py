@@ -8,6 +8,7 @@ growing without bound across turns.
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from typing import Callable, Optional
 
@@ -34,9 +35,21 @@ class CompactionResult:
     record: Optional[CompactionRecord]
 
 
+def estimate_message_chars(message: ConversationMessage) -> int:
+    """Characters this message contributes to the next request.
+
+    Measured from `to_wire()`, not from `text()`. A tool_use block carries its
+    arguments in `block.input`, which `text()` cannot see but which is
+    serialised into `tool_calls` and sent on every subsequent request. Counting
+    text alone undercounts a file-writing session by a large factor and lets
+    history grow past the threshold unnoticed.
+    """
+    return len(json.dumps(message.to_wire(), ensure_ascii=False))
+
+
 def estimate_session_tokens(session: Session) -> int:
     """Cheap character-based estimate. Good enough to drive a threshold."""
-    total = sum(len(message.text()) for message in session.messages)
+    total = sum(estimate_message_chars(message) for message in session.messages)
     return total // CHARS_PER_TOKEN
 
 
