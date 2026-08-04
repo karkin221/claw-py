@@ -194,6 +194,8 @@ python -m claw_py.cli --parallel-tools 4 "..."              # concurrent reads
 python -m claw_py.cli --trace t.jsonl --list-sessions       # what can I resume?
 python -m claw_py.cli --trace t.jsonl --resume "..."        # resume the latest
 python -m claw_py.cli --trace t.jsonl --resume a1b2c3 "..." # resume by id
+python -m claw_py.cli --trace t.jsonl --resume --rebuild-prompt "..."  # ignore
+                                                            # the recorded prompt
 ```
 
 ### 6. Run the tests
@@ -202,13 +204,13 @@ python -m claw_py.cli --trace t.jsonl --resume a1b2c3 "..." # resume by id
 python -m unittest discover -s tests -v
 ```
 
-98 tests, no network, no model. They cover the loop, the iteration cap, tool
+106 tests, no network, no model. They cover the loop, the iteration cap, tool
 failures, all five permission modes, hook rewrite/deny/override, post-hook error
 flipping, compaction, the session health probe, subagent tool restriction, mode
 narrowing, depth limiting, hook inheritance, context isolation, the router's
 fragmented-tool-call reassembly, MCP handshake/dispatch/concurrency against a
 real subprocess, trace replay including compaction and truncated writes, and
-parallel dispatch ordering guarantees, and two regressions found by reading a
+parallel dispatch ordering guarantees, and three regressions found by reading a
 real production trace (see the commit log).
 
 ---

@@ -16,7 +16,14 @@ from .api import DEFAULT_BASE_URL, DEFAULT_MODEL, ApiClient
 from .compact import CompactionConfig
 from .conversation import ConversationRuntime
 from .mcp import McpError, McpServerManager, load_mcp_config
-from .persistence import format_session_list, list_sessions, replay_session
+from .persistence import (
+    SessionEnvironment,
+    describe_environment_drift,
+    format_session_list,
+    list_sessions,
+    replay_environment,
+    replay_session,
+)
 from .hooks import HookEvent, HookRegistry, HookResult
 from .permissions import ConsolePrompter, PermissionMode, PermissionPolicy
 from .prompt import build_system_prompt
@@ -78,10 +85,13 @@ def default_hook_registry() -> HookRegistry:
 def build_runtime(args: argparse.Namespace) -> ConversationRuntime:
     cwd = Path(args.cwd).expanduser().resolve()
     permission_mode = PermissionMode.from_str(args.permission_mode)
+    recorded_environment = None
     if args.resume:
         if not args.trace:
             raise SystemExit("--resume needs --trace pointing at the trace file")
-        session = replay_session(Path(args.trace), None if args.resume == "last" else args.resume)
+        wanted = None if args.resume == "last" else args.resume
+        session = replay_session(Path(args.trace), wanted)
+        recorded_environment = replay_environment(Path(args.trace), session.session_id)
         print(
             f"  resumed session {session.session_id} "
             f"({len(session.messages)} message(s))",
@@ -147,6 +157,34 @@ def build_runtime(args: argparse.Namespace) -> ConversationRuntime:
         tool_executor = build_tool_executor(agent_config, depth=0)
 
     system_prompt, memory_files = build_system_prompt(cwd, tool_executor.names())
+
+    # A resumed session must run under the prompt that produced its history,
+    # or the model silently gets different instructions than it had before.
+    if recorded_environment is not None:
+        current_environment = SessionEnvironment(
+            system_prompt=system_prompt,
+            tool_names=tool_executor.names(),
+            permission_mode=permission_mode.as_str(),
+            workspace_root=str(cwd),
+            model=args.model,
+        )
+        drift = describe_environment_drift(recorded_environment, current_environment)
+        for note in drift:
+            print(f"  drift: {note}", file=sys.stderr)
+        if recorded_environment.system_prompt and not args.rebuild_prompt:
+            if system_prompt != recorded_environment.system_prompt:
+                print(
+                    "  using the recorded system prompt "
+                    "(pass --rebuild-prompt to use the current one)",
+                    file=sys.stderr,
+                )
+            system_prompt = recorded_environment.system_prompt
+    elif args.resume:
+        print(
+            "  note: this trace predates session_started; "
+            "the system prompt was rebuilt from the current directory",
+            file=sys.stderr,
+        )
 
     api_client = client_factory(args.model)
     api_client.tool_specs = tool_executor.wire_specs()
@@ -227,6 +265,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--list-sessions", action="store_true", help="list resumable sessions in --trace"
+    )
+    parser.add_argument(
+        "--rebuild-prompt",
+        action="store_true",
+        help="on resume, use the current system prompt instead of the recorded one",
     )
     parser.add_argument(
         "--parallel-tools",

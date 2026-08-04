@@ -801,6 +801,28 @@ def record_message_appended(self, message: ConversationMessage) -> None:
 Called at exactly the three points a message enters the session: the user turn,
 each assistant message, and each tool result.
 
+Messages are not the whole story, though. The system prompt and the tools array
+are sent on *every* request but live outside `session.messages` — so a trace of
+messages alone cannot reproduce the conditions that produced its own history.
+`session_started` records them once per runtime:
+
+```python
+self.session_tracer.emit(
+    "session_started",
+    system_prompt=self.system_prompt,
+    tool_names=self.offered_tool_names(),
+    permission_mode=self.permission_policy.mode.as_str(),
+    workspace_root=str(self.permission_policy.workspace_root),
+    model=getattr(self.api_client, "model", ""),
+    max_iterations=self.max_iterations,
+)
+```
+
+`offered_tool_names()` intersects the registry with `allowed_tools` rather than
+listing the registry, because a subagent shares the parent's executor and is
+narrowed by policy — recording registry names would claim an `explore` agent
+had `write_file` when it was never offered it.
+
 Resuming is then a **fold over the log**, not a deserialisation:
 
 ```python
@@ -813,7 +835,23 @@ for event in read_events(path):
         messages = [get_compact_continuation_message(summary), *messages[dropped:]]
 ```
 
-Three properties fall out of this for free:
+Without this, `--resume` rebuilt the system prompt from the *current*
+directory. Add a `CLAUDE.md`, or resume from somewhere else, and the model
+silently received different instructions than the ones that produced its
+history. Now the recorded prompt wins, drift is reported, and
+`--rebuild-prompt` opts out:
+
+```
+  resumed session 179425a9acc3 (4 message(s))
+  drift: system prompt changed (379 chars recorded, 504 now)
+  using the recorded system prompt (pass --rebuild-prompt to use the current one)
+```
+
+Traces written before `session_started` existed return `None` from
+`replay_environment` and still resume — the prompt is rebuilt, with a note
+saying so.
+
+Four properties fall out of this for free:
 
 **1. A resumed session cannot disagree with its own trace**, because they are
 the same artifact.
@@ -823,7 +861,10 @@ many messages were dropped and the summary that replaced them; replay applies
 *exactly the transformation `compact_session` applied*. No compacted state is
 ever stored — only the instruction that produced it.
 
-**3. A truncated trace still resumes.** `read_events` skips an unparseable final
+**3. Resume is faithful, or loudly isn't.** The environment travels with the
+history, and any divergence is reported rather than silently applied.
+
+**4. A truncated trace still resumes.** `read_events` skips an unparseable final
 line, so a process killed mid-write resumes to its last consistent point. There
 is a test that appends `{"ts": 1, "kind": "message_app` and asserts the replay
 is still complete.

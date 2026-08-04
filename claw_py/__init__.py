@@ -24,7 +24,10 @@ from .mcp import (
     load_mcp_config,
 )
 from .persistence import (
+    SessionEnvironment,
     SessionInfo,
+    describe_environment_drift,
+    replay_environment,
     deserialize_message,
     list_sessions,
     replay_session,
@@ -82,6 +85,7 @@ __all__ = [
     "RISK_READ",
     "RISK_WRITE",
     "Session",
+    "SessionEnvironment",
     "SessionInfo",
     "SessionTracer",
     "ToolExecutor",
@@ -96,6 +100,7 @@ __all__ = [
     "build_tool_executor",
     "compact_session",
     "default_tool_executor",
+    "describe_environment_drift",
     "deserialize_message",
     "execute_agent",
     "list_sessions",
@@ -103,6 +108,7 @@ __all__ = [
     "make_agent_tool",
     "merge_hook_feedback",
     "normalize_subagent_type",
+    "replay_environment",
     "replay_session",
     "serialize_message",
 ]

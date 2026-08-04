@@ -133,6 +133,9 @@ class Session:
     session_id: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
     messages: list[ConversationMessage] = field(default_factory=list)
     compaction: Optional[CompactionRecord] = None
+    # Set by replay_session: the system prompt the history was produced under.
+    # A resumed session must not silently get a different one.
+    system_prompt: Optional[str] = None
 
     def push_user_text(self, text: str) -> None:
         if not text.strip():
@@ -147,6 +150,7 @@ class Session:
             session_id=branch_name or uuid.uuid4().hex[:12],
             messages=list(self.messages),
             compaction=self.compaction,
+            system_prompt=self.system_prompt,
         )
 
 

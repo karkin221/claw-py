@@ -19,7 +19,13 @@ from claw_py.api import ApiClient  # noqa: E402
 from claw_py.conversation import ConversationRuntime  # noqa: E402
 from claw_py.mcp import McpServerConfig, McpServerManager  # noqa: E402
 from claw_py.permissions import ConsolePrompter, PermissionMode, PermissionPolicy  # noqa: E402
-from claw_py.persistence import list_sessions, replay_session  # noqa: E402
+from claw_py.persistence import (  # noqa: E402
+    describe_environment_drift,
+    list_sessions,
+    replay_environment,
+    replay_session,
+)
+from claw_py.persistence import SessionEnvironment  # noqa: E402
 from claw_py.telemetry import SessionTracer  # noqa: E402
 from claw_py.tools import RISK_READ, ToolSpec, default_tool_executor  # noqa: E402
 from claw_py.types import ApiRequest, Session  # noqa: E402
@@ -169,7 +175,18 @@ def main() -> None:
 
     original_id = sessions[0].session_id
     resumed = replay_session(trace_path, original_id)
+    recorded = replay_environment(trace_path, original_id)
+    drifted = SessionEnvironment(
+        system_prompt="(scripted) plus a CLAUDE.md the user added later",
+        tool_names=recorded.tool_names,
+        permission_mode=recorded.permission_mode,
+        workspace_root=recorded.workspace_root,
+        model=recorded.model,
+    )
     print(f"\n  replayed   : {resumed.session_id} → {len(resumed.messages)} messages")
+    print(f"  prompt     : restored {len(resumed.system_prompt or '')} chars from the trace")
+    for note in describe_environment_drift(recorded, drifted):
+        print(f"  drift      : {note}")
     print("  roles      :", " ".join(m.role[:4] for m in resumed.messages))
     print(f"  last text  : {resumed.messages[-1].text()[:52]!r}")
 

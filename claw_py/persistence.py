@@ -65,6 +65,23 @@ def deserialize_message(raw: dict[str, Any]) -> ConversationMessage:
 
 
 @dataclass
+class SessionEnvironment:
+    """The non-message conditions a session ran under.
+
+    Recorded by `session_started`. Everything here is sent to the model on
+    every request but lives outside `session.messages`, so without it a replay
+    reproduces the conversation but not the conditions that produced it.
+    """
+
+    system_prompt: str = ""
+    tool_names: list[str] = field(default_factory=list)
+    permission_mode: str = ""
+    workspace_root: str = ""
+    model: str = ""
+    max_iterations: int = 0
+
+
+@dataclass
 class SessionInfo:
     session_id: str
     turns: int = 0
@@ -140,6 +157,68 @@ def list_sessions(path: Path, include_subagents: bool = False) -> list[SessionIn
     return result
 
 
+def replay_environment(
+    path: Path, session_id: Optional[str] = None
+) -> Optional[SessionEnvironment]:
+    """The environment a session last ran under, or None if never recorded.
+
+    Traces written before `session_started` existed return None; callers should
+    fall back to rebuilding rather than failing.
+    """
+    if session_id is None:
+        candidates = list_sessions(path)
+        if not candidates:
+            return None
+        session_id = max(candidates, key=lambda info: info.last_ts).session_id
+
+    environment: Optional[SessionEnvironment] = None
+    for event in read_events(path):
+        if event.get("session_id") != session_id or event.get("kind") != "session_started":
+            continue
+        # Last one wins: it is the environment the newest messages ran under.
+        environment = SessionEnvironment(
+            system_prompt=event.get("system_prompt") or "",
+            tool_names=list(event.get("tool_names") or []),
+            permission_mode=event.get("permission_mode") or "",
+            workspace_root=event.get("workspace_root") or "",
+            model=event.get("model") or "",
+            max_iterations=int(event.get("max_iterations") or 0),
+        )
+    return environment
+
+
+def describe_environment_drift(
+    recorded: SessionEnvironment, current: SessionEnvironment
+) -> list[str]:
+    """Human-readable differences between a recorded and a current environment."""
+    drift: list[str] = []
+    if recorded.system_prompt and recorded.system_prompt != current.system_prompt:
+        drift.append(
+            f"system prompt changed ({len(recorded.system_prompt)} chars recorded, "
+            f"{len(current.system_prompt)} now)"
+        )
+    if recorded.tool_names and set(recorded.tool_names) != set(current.tool_names):
+        added = sorted(set(current.tool_names) - set(recorded.tool_names))
+        removed = sorted(set(recorded.tool_names) - set(current.tool_names))
+        parts = []
+        if added:
+            parts.append(f"added {', '.join(added)}")
+        if removed:
+            parts.append(f"removed {', '.join(removed)}")
+        drift.append("tool list changed: " + "; ".join(parts))
+    if recorded.permission_mode and recorded.permission_mode != current.permission_mode:
+        drift.append(
+            f"permission mode changed ({recorded.permission_mode} → {current.permission_mode})"
+        )
+    if recorded.workspace_root and recorded.workspace_root != current.workspace_root:
+        drift.append(
+            f"workspace changed ({recorded.workspace_root} → {current.workspace_root})"
+        )
+    if recorded.model and recorded.model != current.model:
+        drift.append(f"model changed ({recorded.model} → {current.model})")
+    return drift
+
+
 def replay_session(path: Path, session_id: Optional[str] = None) -> Session:
     """Rebuild a Session by folding its trace events in order.
 
@@ -153,6 +232,7 @@ def replay_session(path: Path, session_id: Optional[str] = None) -> Session:
 
     messages: list[ConversationMessage] = []
     compaction: Optional[CompactionRecord] = None
+    system_prompt: Optional[str] = None
     seen = False
 
     for event in read_events(path):
@@ -161,7 +241,10 @@ def replay_session(path: Path, session_id: Optional[str] = None) -> Session:
         seen = True
         kind = event.get("kind")
 
-        if kind == "message_appended":
+        if kind == "session_started":
+            system_prompt = event.get("system_prompt") or system_prompt
+
+        elif kind == "message_appended":
             messages.append(deserialize_message(event.get("message") or {}))
 
         elif kind == "auto_compaction":
@@ -183,7 +266,12 @@ def replay_session(path: Path, session_id: Optional[str] = None) -> Session:
     if not seen:
         raise RuntimeError(f"no session `{session_id}` in {path}")
 
-    return Session(session_id=session_id, messages=messages, compaction=compaction)
+    return Session(
+        session_id=session_id,
+        messages=messages,
+        compaction=compaction,
+        system_prompt=system_prompt,
+    )
 
 
 def format_session_list(sessions: list[SessionInfo]) -> str:

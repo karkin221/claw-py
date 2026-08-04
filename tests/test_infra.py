@@ -673,3 +673,150 @@ class CallIdTests(unittest.TestCase):
         finished = [e for e in sink if e["kind"] == "tool_finished"][0]
         self.assertTrue(started["tool_use_id"])
         self.assertEqual(started["tool_use_id"], finished["tool_use_id"])
+
+
+class SessionEnvironmentTests(unittest.TestCase):
+    """The system prompt and tool list are sent every request but live outside
+    session.messages, so a trace without them cannot reproduce its own history.
+    """
+
+    def setUp(self) -> None:
+        self.workspace = Path(tempfile.mkdtemp(prefix="claw-py-env-"))
+        self.trace = self.workspace / "trace.jsonl"
+
+    def _run(self, system_prompt="(original prompt)", executor=None, **kw):
+        from claw_py.permissions import PermissionPolicy
+
+        executor = executor or default_tool_executor()
+        session = kw.pop("session", None) or Session()
+        tracer = SessionTracer(session.session_id, path=self.trace)
+        runtime = ConversationRuntime(
+            api_client=ScriptedApiClient([[]]),
+            tool_executor=executor,
+            permission_policy=PermissionPolicy(workspace_root=self.workspace),
+            system_prompt=system_prompt,
+            session=session,
+            session_tracer=tracer,
+            **kw,
+        )
+        runtime.run_turn("do the thing")
+        tracer.close()
+        return runtime
+
+    def test_session_started_records_the_environment(self) -> None:
+        from claw_py.persistence import replay_environment
+
+        runtime = self._run()
+        env = replay_environment(self.trace, runtime.session.session_id)
+        self.assertIsNotNone(env)
+        self.assertEqual(env.system_prompt, "(original prompt)")
+        self.assertIn("read_file", env.tool_names)
+        self.assertEqual(env.permission_mode, "workspace-write")
+
+    def test_replay_restores_the_system_prompt(self) -> None:
+        from claw_py.persistence import replay_session
+
+        runtime = self._run(system_prompt="you are a very specific agent")
+        resumed = replay_session(self.trace, runtime.session.session_id)
+        self.assertEqual(resumed.system_prompt, "you are a very specific agent")
+
+    def test_drift_is_reported_when_the_prompt_changes(self) -> None:
+        from claw_py.persistence import (
+            SessionEnvironment,
+            describe_environment_drift,
+            replay_environment,
+        )
+
+        runtime = self._run(system_prompt="original")
+        recorded = replay_environment(self.trace, runtime.session.session_id)
+        current = SessionEnvironment(
+            system_prompt="original plus a CLAUDE.md section",
+            tool_names=recorded.tool_names,
+            permission_mode=recorded.permission_mode,
+            workspace_root=recorded.workspace_root,
+            model=recorded.model,
+        )
+        drift = describe_environment_drift(recorded, current)
+        self.assertEqual(len(drift), 1)
+        self.assertIn("system prompt changed", drift[0])
+
+    def test_drift_reports_added_and_removed_tools(self) -> None:
+        from claw_py.persistence import SessionEnvironment, describe_environment_drift
+
+        recorded = SessionEnvironment(system_prompt="p", tool_names=["read_file", "bash"])
+        current = SessionEnvironment(system_prompt="p", tool_names=["read_file", "agent"])
+        drift = describe_environment_drift(recorded, current)
+        self.assertIn("added agent", drift[0])
+        self.assertIn("removed bash", drift[0])
+
+    def test_identical_environments_report_no_drift(self) -> None:
+        from claw_py.persistence import (
+            SessionEnvironment,
+            describe_environment_drift,
+            replay_environment,
+        )
+
+        runtime = self._run()
+        recorded = replay_environment(self.trace, runtime.session.session_id)
+        same = SessionEnvironment(
+            system_prompt=recorded.system_prompt,
+            tool_names=list(recorded.tool_names),
+            permission_mode=recorded.permission_mode,
+            workspace_root=recorded.workspace_root,
+            model=recorded.model,
+        )
+        self.assertEqual(describe_environment_drift(recorded, same), [])
+
+    def test_older_traces_without_the_event_return_none(self) -> None:
+        from claw_py.persistence import replay_environment, replay_session
+
+        legacy = self.workspace / "legacy.jsonl"
+        legacy.write_text(
+            '{"ts": 1, "session_id": "old1", "kind": "turn_started", "chars": 3}\n'
+            '{"ts": 2, "session_id": "old1", "kind": "message_appended",'
+            ' "message": {"role": "user", "blocks": [{"kind": "text", "text": "hi"}]}}\n'
+        )
+        self.assertIsNone(replay_environment(legacy, "old1"))
+        session = replay_session(legacy, "old1")  # still resumable
+        self.assertIsNone(session.system_prompt)
+        self.assertEqual(len(session.messages), 1)
+
+    def test_subagents_record_their_own_environment(self) -> None:
+        from claw_py.agents import AgentConfig, build_tool_executor
+        from claw_py.hooks import HookRegistry
+        from claw_py.permissions import PermissionPolicy
+        from claw_py.persistence import list_sessions, replay_environment
+
+        session = Session()
+        tracer = SessionTracer(session.session_id, path=self.trace)
+        config = AgentConfig(
+            client_factory=lambda model: ScriptedApiClient([[]]),
+            workspace_root=self.workspace,
+            hook_registry=HookRegistry(),
+            session_tracer=tracer,
+            max_depth=1,
+        )
+        executor = build_tool_executor(config, depth=0)
+        runtime = ConversationRuntime(
+            api_client=ScriptedApiClient([
+                [("agent", {"description": "d", "prompt": "p", "subagent_type": "explore"})],
+                [],
+            ]),
+            tool_executor=executor,
+            permission_policy=PermissionPolicy(workspace_root=self.workspace),
+            system_prompt="(parent)",
+            session=session,
+            session_tracer=tracer,
+        )
+        runtime.run_turn("delegate")
+        tracer.close()
+
+        child = [i for i in list_sessions(self.trace, include_subagents=True) if i.is_subagent][0]
+        child_env = replay_environment(self.trace, child.session_id)
+        self.assertIn("explore", child_env.system_prompt)
+        self.assertEqual(child_env.permission_mode, "read-only")
+        self.assertNotIn("write_file", child_env.tool_names)
+
+    def test_forked_session_carries_the_prompt(self) -> None:
+        session = Session(system_prompt="carried")
+        self.assertEqual(session.fork_session().system_prompt, "carried")

@@ -77,6 +77,7 @@ class ConversationRuntime:
         self.parallel_tools = max(1, parallel_tools)
         self.usage_tracker = UsageTracker()
         self.on_text = on_text
+        self.record_session_started()
 
     # ------------------------------------------------------------------
     # the loop
@@ -415,6 +416,35 @@ class ConversationRuntime:
             text_chars=len(assistant_message.text()),
             pending_tool_uses=pending,
         )
+
+    def record_session_started(self) -> None:
+        """Record everything the model saw that is not a message.
+
+        The system prompt and tool list are sent on every request but never
+        enter `session.messages`, so a trace without them cannot reproduce the
+        conditions that produced its own history.
+        """
+        self.session_tracer.emit(
+            "session_started",
+            system_prompt=self.system_prompt,
+            tool_names=self.offered_tool_names(),
+            permission_mode=self.permission_policy.mode.as_str(),
+            workspace_root=str(self.permission_policy.workspace_root),
+            model=getattr(self.api_client, "model", ""),
+            max_iterations=self.max_iterations,
+        )
+
+    def offered_tool_names(self) -> list[str]:
+        """What this runtime could actually call.
+
+        Not the same as the registry. A subagent shares the full executor and
+        is narrowed by `allowed_tools`, so recording registry names would claim
+        an explore agent had `write_file` when it was never offered it.
+        """
+        names = set(self.tool_executor.names())
+        if self.permission_policy.allowed_tools is not None:
+            names &= self.permission_policy.allowed_tools
+        return sorted(names)
 
     def record_message_appended(self, message: ConversationMessage) -> None:
         """The event that makes the trace a complete, resumable log."""
