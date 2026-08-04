@@ -25,6 +25,7 @@ from claw_py.mcp import (
     load_mcp_config,
     normalize_schema,
 )
+from claw_py.hooks import HookEvent, HookRegistry, HookResult
 from claw_py.permissions import PermissionMode, PermissionPolicy
 from claw_py.persistence import (
     deserialize_message,
@@ -820,3 +821,161 @@ class SessionEnvironmentTests(unittest.TestCase):
     def test_forked_session_carries_the_prompt(self) -> None:
         session = Session(system_prompt="carried")
         self.assertEqual(session.fork_session().system_prompt, "carried")
+
+
+class PermissionDecisionTests(unittest.TestCase):
+    """A denial used to be visible only as a missing tool_started, with no way
+    to tell a hook veto from a policy refusal from a declined prompt.
+    """
+
+    def setUp(self) -> None:
+        self.workspace = Path(tempfile.mkdtemp(prefix="claw-py-decision-"))
+        (self.workspace / "a.txt").write_text("x\n")
+        self.sink: list = []
+        outer = self
+
+        class Collecting(SessionTracer):
+            def emit(self, kind, **fields):
+                outer.sink.append({"kind": kind, **fields})
+
+        self.tracer_cls = Collecting
+
+    def _run(self, calls, hooks=None, prompter=None, mode=None):
+        from claw_py.permissions import PermissionMode, PermissionPolicy
+
+        executor = default_tool_executor()
+        session = Session()
+        runtime = ConversationRuntime(
+            api_client=ScriptedApiClient([calls, []]),
+            tool_executor=executor,
+            permission_policy=PermissionPolicy(
+                mode=mode or PermissionMode.WORKSPACE_WRITE,
+                workspace_root=self.workspace,
+                risk_lookup=executor.risk_for,
+            ),
+            system_prompt="(test)",
+            session=session,
+            hook_registry=hooks or HookRegistry(),
+            session_tracer=self.tracer_cls(session.session_id),
+        )
+        runtime.run_turn("go", prompter=prompter)
+        return [e for e in self.sink if e["kind"] == "permission_decision"]
+
+    def test_allowed_call_records_a_decision(self) -> None:
+        decisions = self._run([("read_file", {"path": str(self.workspace / "a.txt")})])
+        self.assertEqual(len(decisions), 1)
+        self.assertTrue(decisions[0]["allowed"])
+        self.assertEqual(decisions[0]["source"], "mode")
+        self.assertEqual(decisions[0]["risk"], RISK_READ)
+
+    def test_hook_denial_is_attributed_to_the_hook(self) -> None:
+        registry = HookRegistry()
+        registry.register(HookEvent.PRE_TOOL_USE, lambda p: HookResult.deny("nope"))
+        decisions = self._run(
+            [("read_file", {"path": str(self.workspace / "a.txt")})], hooks=registry
+        )
+        self.assertFalse(decisions[0]["allowed"])
+        self.assertEqual(decisions[0]["source"], "hook")
+
+    def test_hook_override_is_distinguishable_from_the_mode(self) -> None:
+        registry = HookRegistry()
+        registry.register(
+            HookEvent.PRE_TOOL_USE, lambda p: HookResult.override("allow", "trusted")
+        )
+        decisions = self._run([("todo_write", {"todos": ["a"]})], hooks=registry)
+        self.assertTrue(decisions[0]["allowed"])
+        self.assertEqual(decisions[0]["source"], "hook_override")
+
+    def test_workspace_denial_is_attributed_to_the_workspace(self) -> None:
+        decisions = self._run([("write_file", {"path": "/etc/nope", "content": "x"})])
+        self.assertEqual(decisions[0]["source"], "workspace")
+
+    def test_missing_prompter_is_distinguishable_from_a_declined_prompt(self) -> None:
+        without = self._run([("bash", {"command": "echo hi"})], prompter=None)
+        self.assertEqual(without[0]["source"], "no_prompter")
+
+        self.sink.clear()
+
+        class Decline:
+            def confirm(self, tool_name, effective_input):
+                return False
+
+        declined = self._run([("bash", {"command": "echo hi"})], prompter=Decline())
+        self.assertEqual(declined[0]["source"], "prompter")
+        self.assertFalse(declined[0]["allowed"])
+
+    def test_approved_prompt_is_recorded(self) -> None:
+        class Approve:
+            def confirm(self, tool_name, effective_input):
+                return True
+
+        decisions = self._run([("bash", {"command": "echo hi"})], prompter=Approve())
+        self.assertTrue(decisions[0]["allowed"])
+        self.assertEqual(decisions[0]["source"], "prompter")
+
+    def test_input_rewrites_are_flagged(self) -> None:
+        registry = HookRegistry()
+        target = str(self.workspace / "a.txt")
+        registry.register(
+            HookEvent.PRE_TOOL_USE, lambda p: HookResult.rewrite({"path": target})
+        )
+        decisions = self._run([("read_file", {"path": "wrong"})], hooks=registry)
+        self.assertTrue(decisions[0]["input_rewritten"])
+
+    def test_decision_carries_the_tool_use_id(self) -> None:
+        decisions = self._run([("read_file", {"path": str(self.workspace / "a.txt")})])
+        started = [e for e in self.sink if e["kind"] == "tool_started"]
+        self.assertEqual(decisions[0]["tool_use_id"], started[0]["tool_use_id"])
+
+    def test_denied_calls_emit_a_decision_but_no_tool_started(self) -> None:
+        decisions = self._run([("write_file", {"path": "/etc/nope", "content": "x"})])
+        self.assertEqual(len(decisions), 1)
+        self.assertEqual([e for e in self.sink if e["kind"] == "tool_started"], [])
+
+    def test_post_hook_rejection_is_distinct_from_tool_failure(self) -> None:
+        registry = HookRegistry()
+        registry.register(
+            HookEvent.POST_TOOL_USE, lambda p: HookResult.deny("failed validation")
+        )
+        self._run([("read_file", {"path": str(self.workspace / "a.txt")})], hooks=registry)
+        rejected = [e for e in self.sink if e["kind"] == "post_tool_use_rejected"]
+        self.assertEqual(len(rejected), 1)
+        self.assertEqual(rejected[0]["decision"], "deny")
+        # the tool itself succeeded; only the post-hook failed it
+        finished = [e for e in self.sink if e["kind"] == "tool_finished"][0]
+        self.assertTrue(finished["is_error"])
+
+    def test_tool_failure_emits_no_rejection_event(self) -> None:
+        self._run([("read_file", {"path": str(self.workspace / "missing.txt")})])
+        self.assertEqual([e for e in self.sink if e["kind"] == "post_tool_use_rejected"], [])
+
+    def test_session_listing_counts_denials(self) -> None:
+        from claw_py.permissions import PermissionPolicy
+        from claw_py.persistence import list_sessions
+
+        trace = self.workspace / "trace.jsonl"
+        executor = default_tool_executor()
+        session = Session()
+        tracer = SessionTracer(session.session_id, path=trace)
+        runtime = ConversationRuntime(
+            api_client=ScriptedApiClient([
+                [
+                    ("read_file", {"path": str(self.workspace / "a.txt")}),
+                    ("write_file", {"path": "/etc/nope", "content": "x"}),
+                ],
+                [],
+            ]),
+            tool_executor=executor,
+            permission_policy=PermissionPolicy(
+                workspace_root=self.workspace, risk_lookup=executor.risk_for
+            ),
+            system_prompt="(test)",
+            session=session,
+            session_tracer=tracer,
+        )
+        runtime.run_turn("go")
+        tracer.close()
+
+        info = list_sessions(trace)[0]
+        self.assertEqual(info.tool_calls, 2)
+        self.assertEqual(info.denials, 1)

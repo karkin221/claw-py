@@ -47,18 +47,30 @@ class PermissionContext:
     permission_reason: Optional[str] = None
 
 
+# Which layer actually decided. Without this, every denial looks identical in
+# the trace and you cannot tell a hook veto from a policy refusal.
+SOURCE_HOOK = "hook"                # PreToolUse short-circuited
+SOURCE_HOOK_OVERRIDE = "hook_override"  # hook supplied permission_override
+SOURCE_ALLOWLIST = "allowlist"      # tool not in allowed_tools (subagents)
+SOURCE_MODE = "mode"                # the permission mode alone decided
+SOURCE_WORKSPACE = "workspace"      # write outside the workspace root
+SOURCE_PROMPTER = "prompter"        # a human answered
+SOURCE_NO_PROMPTER = "no_prompter"  # escalation needed, nobody to ask
+
+
 @dataclass
 class PermissionOutcome:
     allowed: bool
     reason: str = ""
+    source: str = SOURCE_MODE
 
     @classmethod
-    def Allow(cls) -> "PermissionOutcome":  # noqa: N802 - mirrors the Rust variant
-        return cls(allowed=True)
+    def Allow(cls, source: str = SOURCE_MODE) -> "PermissionOutcome":  # noqa: N802
+        return cls(allowed=True, source=source)
 
     @classmethod
-    def Deny(cls, reason: str) -> "PermissionOutcome":  # noqa: N802
-        return cls(allowed=False, reason=reason)
+    def Deny(cls, reason: str, source: str = SOURCE_MODE) -> "PermissionOutcome":  # noqa: N802
+        return cls(allowed=False, reason=reason, source=source)
 
 
 class PermissionPrompter(Protocol):
@@ -112,29 +124,31 @@ class PermissionPolicy:
         override = permission_context.permission_override
         if override == "deny":
             return PermissionOutcome.Deny(
-                permission_context.permission_reason or "denied by hook override"
+                permission_context.permission_reason or "denied by hook override",
+                SOURCE_HOOK_OVERRIDE,
             )
         if override == "allow":
-            return PermissionOutcome.Allow()
+            return PermissionOutcome.Allow(SOURCE_HOOK_OVERRIDE)
 
         # 2. An explicit allowlist, if configured.
         if self.allowed_tools is not None and tool_name not in self.allowed_tools:
             return PermissionOutcome.Deny(
-                f"`{tool_name}` is not in the allowed tool list"
+                f"`{tool_name}` is not in the allowed tool list", SOURCE_ALLOWLIST
             )
 
         # 3. Mode.
         if self.mode in (PermissionMode.ALLOW, PermissionMode.DANGER_FULL_ACCESS):
-            return PermissionOutcome.Allow()
+            return PermissionOutcome.Allow(SOURCE_MODE)
 
         risk = self.risk_for(tool_name)
 
         if self.mode is PermissionMode.READ_ONLY:
             if risk != RISK_READ:
                 return PermissionOutcome.Deny(
-                    f"`{tool_name}` mutates state and the session is read-only"
+                    f"`{tool_name}` mutates state and the session is read-only",
+                    SOURCE_MODE,
                 )
-            return PermissionOutcome.Allow()
+            return PermissionOutcome.Allow(SOURCE_MODE)
 
         if self.mode is PermissionMode.PROMPT:
             return self._escalate(tool_name, effective_input, prompter)
@@ -146,12 +160,13 @@ class PermissionPolicy:
             target = effective_input.get("path", "")
             # A write tool with no path argument cannot be workspace-checked.
             if not target:
-                return PermissionOutcome.Allow()
+                return PermissionOutcome.Allow(SOURCE_MODE)
             if not self._inside_workspace(target):
                 return PermissionOutcome.Deny(
-                    f"`{target}` is outside the workspace root {self.workspace_root}"
+                    f"`{target}` is outside the workspace root {self.workspace_root}",
+                    SOURCE_WORKSPACE,
                 )
-        return PermissionOutcome.Allow()
+        return PermissionOutcome.Allow(SOURCE_MODE)
 
     def _escalate(
         self,
@@ -162,11 +177,12 @@ class PermissionPolicy:
         # No prompter means non-interactive: deny rather than silently allow.
         if prompter is None:
             return PermissionOutcome.Deny(
-                f"`{tool_name}` needs approval but no prompter is attached"
+                f"`{tool_name}` needs approval but no prompter is attached",
+                SOURCE_NO_PROMPTER,
             )
         if prompter.confirm(tool_name, effective_input):
-            return PermissionOutcome.Allow()
-        return PermissionOutcome.Deny(f"user declined `{tool_name}`")
+            return PermissionOutcome.Allow(SOURCE_PROMPTER)
+        return PermissionOutcome.Deny(f"user declined `{tool_name}`", SOURCE_PROMPTER)
 
     def _inside_workspace(self, target: str) -> bool:
         if not target:

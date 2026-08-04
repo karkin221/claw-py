@@ -204,14 +204,14 @@ python -m claw_py.cli --trace t.jsonl --resume --rebuild-prompt "..."  # ignore
 python -m unittest discover -s tests -v
 ```
 
-106 tests, no network, no model. They cover the loop, the iteration cap, tool
+118 tests, no network, no model. They cover the loop, the iteration cap, tool
 failures, all five permission modes, hook rewrite/deny/override, post-hook error
 flipping, compaction, the session health probe, subagent tool restriction, mode
 narrowing, depth limiting, hook inheritance, context isolation, the router's
 fragmented-tool-call reassembly, MCP handshake/dispatch/concurrency against a
 real subprocess, trace replay including compaction and truncated writes, and
-parallel dispatch ordering guarantees, and three regressions found by reading a
-real production trace (see the commit log).
+parallel dispatch ordering guarantees, every permission-decision source, and three regressions
+found by reading a real production trace (see the commit log).
 
 ---
 

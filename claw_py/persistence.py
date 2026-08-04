@@ -89,6 +89,8 @@ class SessionInfo:
     first_prompt: str = ""
     last_ts: float = 0.0
     compactions: int = 0
+    tool_calls: int = 0
+    denials: int = 0
     subagent_of: Optional[str] = None
     depth: int = 0
 
@@ -137,6 +139,10 @@ def list_sessions(path: Path, include_subagents: bool = False) -> list[SessionIn
                 info.first_prompt = "".join(
                     b.get("text", "") for b in message.get("blocks", [])
                 )[:80]
+        elif kind == "permission_decision":
+            info.tool_calls += 1
+            if not event.get("allowed", True):
+                info.denials += 1
         elif kind == "auto_compaction":
             info.compactions += 1
         elif kind == "subagent_started":
@@ -277,10 +283,14 @@ def replay_session(path: Path, session_id: Optional[str] = None) -> Session:
 def format_session_list(sessions: list[SessionInfo]) -> str:
     if not sessions:
         return "no resumable sessions"
-    lines = [f"{'session':<14} {'turns':>5} {'msgs':>5} {'cmpt':>5}  first prompt"]
+    lines = [
+        f"{'session':<14} {'turns':>5} {'msgs':>5} {'tools':>6} {'deny':>5} "
+        f"{'cmpt':>5}  first prompt"
+    ]
     for info in sorted(sessions, key=lambda i: i.last_ts):
         lines.append(
             f"{info.session_id:<14} {info.turns:>5} {info.messages:>5} "
-            f"{info.compactions:>5}  {info.first_prompt}"
+            f"{info.tool_calls:>6} {info.denials:>5} {info.compactions:>5}  "
+            f"{info.first_prompt}"
         )
     return "\n".join(lines)

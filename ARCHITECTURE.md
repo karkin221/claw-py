@@ -332,6 +332,19 @@ mechanism behind flags like `--dangerously-skip-permissions` in the original: th
 dangerous thing isn't skipping the prompt, it's changing the mode so the prompt is
 never reached.
 
+Whatever decides, the decision is recorded before execution:
+
+```json
+{"kind": "permission_decision", "tool_name": "bash", "allowed": true,
+ "source": "prompter", "risk": "escalate", "input_rewritten": false}
+```
+
+`source` is the useful field. Without it every denial looks identical in the
+trace, and you cannot tell a hook veto (`hook`) from a policy refusal (`mode`,
+`workspace`, `allowlist`) from a declined prompt (`prompter`) from an
+escalation with nobody to ask (`no_prompter`). `hook_override` marks the case
+where a hook authorised something the mode forbade — the one worth alerting on.
+
 A denial is not an exception. It becomes a tool result:
 
 ```python
@@ -416,6 +429,10 @@ if post_rejected:
 This is how you build a post-hoc validation gate — run a linter on written code,
 reject output that fails schema validation, catch a `bash` command that succeeded
 but produced something unacceptable.
+
+A post-hook rejection also emits `post_tool_use_rejected`, because otherwise
+`is_error: true` is ambiguous — it could mean the tool crashed or that the tool
+succeeded and a validation gate refused its output.
 
 Finally `merge_hook_feedback` splices hook commentary into the output the model
 sees, prefixed as `[hook note]` or `[hook error]`, and the result is packed into a

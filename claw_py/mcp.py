@@ -122,15 +122,22 @@ class McpClient:
     def stop(self) -> None:
         if self.process is None:
             return
+        process, self.process = self.process, None
         try:
-            if self.process.stdin:
-                self.process.stdin.close()
-            self.process.terminate()
-            self.process.wait(timeout=5)
+            if process.stdin:
+                process.stdin.close()
+            process.terminate()
+            process.wait(timeout=5)
         except (subprocess.TimeoutExpired, OSError):
-            self.process.kill()
+            process.kill()
         finally:
-            self.process = None
+            # stdin is closed above; the read pipes leak handles without this.
+            for pipe in (process.stdout, process.stderr):
+                if pipe is not None:
+                    try:
+                        pipe.close()
+                    except OSError:
+                        pass
 
     def _drain_stderr(self) -> None:
         process = self.process

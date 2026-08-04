@@ -21,6 +21,7 @@ from .hooks import (
     merge_hook_feedback,
 )
 from .permissions import (
+    SOURCE_HOOK,
     PermissionContext,
     PermissionOutcome,
     PermissionPolicy,
@@ -157,7 +158,9 @@ class ConversationRuntime:
             # Kept serial so hook ordering is deterministic and only one
             # permission prompt can ever be in front of the user at a time.
             plans = [
-                self._authorize_tool_call(tool_use_id, tool_name, input, prompter)
+                self._authorize_tool_call(
+                    iterations, tool_use_id, tool_name, input, prompter
+                )
                 for tool_use_id, tool_name, input in pending_tool_uses
             ]
 
@@ -189,6 +192,7 @@ class ConversationRuntime:
 
     def _authorize_tool_call(
         self,
+        iterations: int,
         tool_use_id: str,
         tool_name: str,
         input: dict[str, Any],
@@ -211,32 +215,39 @@ class ConversationRuntime:
             permission_outcome = PermissionOutcome.Deny(
                 format_hook_message(
                     pre_hook_result, f"PreToolUse hook cancelled tool `{tool_name}`"
-                )
+                ),
+                SOURCE_HOOK,
             )
         elif pre_hook_result.is_failed():
             permission_outcome = PermissionOutcome.Deny(
                 format_hook_message(
                     pre_hook_result, f"PreToolUse hook failed for tool `{tool_name}`"
-                )
+                ),
+                SOURCE_HOOK,
             )
         elif pre_hook_result.is_denied():
             permission_outcome = PermissionOutcome.Deny(
                 format_hook_message(
                     pre_hook_result, f"PreToolUse hook denied tool `{tool_name}`"
-                )
+                ),
+                SOURCE_HOOK,
             )
         else:
             permission_outcome = self.permission_policy.authorize_with_context(
                 tool_name, effective_input, permission_context, prompter
             )
 
-        return ToolPlan(
+        plan = ToolPlan(
             tool_use_id=tool_use_id,
             tool_name=tool_name,
             effective_input=effective_input,
             pre_hook_result=pre_hook_result,
             permission_outcome=permission_outcome,
         )
+        self.record_permission_decision(
+            iterations, plan, rewritten=pre_hook_result.updated_input() is not None
+        )
+        return plan
 
     def _is_parallel_safe(self, plan: ToolPlan) -> bool:
         """Only idempotent reads run concurrently. Writes keep their order."""
@@ -328,6 +339,7 @@ class ConversationRuntime:
         )
         if post_rejected:
             is_error = True
+            self.record_post_tool_use_rejected(plan, post_hook_result.decision)
         output = merge_hook_feedback(post_hook_result.messages(), output, post_rejected)
 
         return ConversationMessage.tool_result(
@@ -452,6 +464,38 @@ class ConversationRuntime:
 
         self.session_tracer.emit(
             "message_appended", message=serialize_message(message)
+        )
+
+    def record_permission_decision(
+        self, iterations: int, plan: ToolPlan, rewritten: bool
+    ) -> None:
+        """Stages 6-7 reached a decision.
+
+        Without this the trace shows only the absence of a `tool_started`, and
+        every denial looks identical — a hook veto, a policy refusal and a
+        declined prompt are indistinguishable without reading prose.
+        """
+        outcome = plan.permission_outcome
+        self.session_tracer.emit(
+            "permission_decision",
+            iteration=iterations,
+            tool_name=plan.tool_name,
+            tool_use_id=plan.tool_use_id,
+            allowed=outcome.allowed,
+            source=outcome.source,
+            reason=outcome.reason,
+            risk=self.tool_executor.risk_for(plan.tool_name),
+            input_rewritten=rewritten,
+        )
+
+    def record_post_tool_use_rejected(self, plan: ToolPlan, decision: str) -> None:
+        """A post-hook flipped a successful tool to an error — otherwise
+        indistinguishable in the trace from the tool itself failing."""
+        self.session_tracer.emit(
+            "post_tool_use_rejected",
+            tool_name=plan.tool_name,
+            tool_use_id=plan.tool_use_id,
+            decision=decision,
         )
 
     def record_parallel_batch(self, iterations: int, tool_names: list[str]) -> None:
