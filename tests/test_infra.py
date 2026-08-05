@@ -979,3 +979,126 @@ class PermissionDecisionTests(unittest.TestCase):
         info = list_sessions(trace)[0]
         self.assertEqual(info.tool_calls, 2)
         self.assertEqual(info.denials, 1)
+
+
+class ProviderFailureTests(unittest.TestCase):
+    """A read-phase timeout raises bare TimeoutError, not URLError. It used to
+    escape every handler, crash the CLI with a traceback, discard whatever the
+    model had already streamed, and never emit turn_failed.
+    """
+
+    @staticmethod
+    def _slow_server(port: int, words: int = 4):
+        import json as _json
+        import threading as _threading
+        import time as _time
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+        class Slow(BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def do_POST(self):  # noqa: N802
+                self.rfile.read(int(self.headers.get("Content-Length", 0)))
+                self.send_response(200)
+                self.send_header("Content-Type", "application/x-ndjson")
+                self.end_headers()
+                for index in range(words):
+                    chunk = _json.dumps({"message": {"content": f"word{index} "}})
+                    self.wfile.write((chunk + "\n").encode())
+                    self.wfile.flush()
+                _time.sleep(3)  # stall mid-generation; client times out well before
+
+        # Threading + daemon threads, or a stalled handler blocks shutdown()
+        # and each test pays the full stall.
+        server = ThreadingHTTPServer(("127.0.0.1", port), Slow)
+        server.daemon_threads = True
+        _threading.Thread(target=server.serve_forever, daemon=True).start()
+        return server
+
+    def test_read_timeout_becomes_a_clean_runtime_error(self) -> None:
+        from claw_py.api import ApiClient, build_assistant_message
+        from claw_py.types import ApiRequest, ConversationMessage
+        from claw_py.types import RuntimeError as ClawError
+
+        server = self._slow_server(8771)
+        try:
+            client = ApiClient(model="stub", base_url="http://127.0.0.1:8771", request_timeout=1)
+            request = ApiRequest("sys", [ConversationMessage.user_text("hi")])
+            with self.assertRaises(ClawError) as ctx:
+                build_assistant_message(client.stream(request))
+            self.assertIn("stopped sending", ctx.exception.message)
+            self.assertIn("--request-timeout", ctx.exception.message)
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_streamed_text_survives_the_timeout(self) -> None:
+        from claw_py.api import ApiClient, build_assistant_message
+        from claw_py.types import ApiRequest, ConversationMessage
+        from claw_py.types import RuntimeError as ClawError
+
+        server = self._slow_server(8772, words=6)
+        try:
+            client = ApiClient(model="stub", base_url="http://127.0.0.1:8772", request_timeout=1)
+            request = ApiRequest("sys", [ConversationMessage.user_text("hi")])
+            with self.assertRaises(ClawError) as ctx:
+                build_assistant_message(client.stream(request))
+            self.assertIn("word0", ctx.exception.partial_text)
+            self.assertIn("word5", ctx.exception.partial_text)
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_turn_failed_is_recorded_with_the_partial_output(self) -> None:
+        from claw_py.api import ApiClient
+        from claw_py.permissions import PermissionPolicy
+        from claw_py.types import RuntimeError as ClawError
+
+        sink: list = []
+
+        class Collecting(SessionTracer):
+            def emit(self, kind, **fields):
+                sink.append({"kind": kind, **fields})
+
+        server = self._slow_server(8773)
+        try:
+            workspace = Path(tempfile.mkdtemp(prefix="claw-py-timeout-"))
+            session = Session()
+            runtime = ConversationRuntime(
+                api_client=ApiClient(
+                    model="stub", base_url="http://127.0.0.1:8773", request_timeout=1
+                ),
+                tool_executor=default_tool_executor(),
+                permission_policy=PermissionPolicy(workspace_root=workspace),
+                system_prompt="(test)",
+                session=session,
+                session_tracer=Collecting(session.session_id),
+            )
+            with self.assertRaises(ClawError):
+                runtime.run_turn("generate something long")
+        finally:
+            server.shutdown()
+            server.server_close()
+
+        failed = [e for e in sink if e["kind"] == "turn_failed"]
+        self.assertEqual(len(failed), 1)
+        self.assertGreater(failed[0]["partial_chars"], 0)
+        self.assertIn("word0", failed[0]["partial_text"])
+
+    def test_connection_refused_still_names_the_service(self) -> None:
+        from claw_py.api import ApiClient
+        from claw_py.types import ApiRequest, ConversationMessage
+        from claw_py.types import RuntimeError as ClawError
+
+        client = ApiClient(model="stub", base_url="http://127.0.0.1:9", request_timeout=1)
+        request = ApiRequest("sys", [ConversationMessage.user_text("hi")])
+        with self.assertRaises(ClawError) as ctx:
+            list(client.stream(request))
+        self.assertIn("ollama serve", ctx.exception.message)
+
+    def test_timeout_is_configurable(self) -> None:
+        from claw_py.api import DEFAULT_REQUEST_TIMEOUT, ApiClient
+
+        self.assertEqual(ApiClient().request_timeout, DEFAULT_REQUEST_TIMEOUT)
+        self.assertEqual(ApiClient(request_timeout=42).request_timeout, 42)

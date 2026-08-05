@@ -14,9 +14,12 @@ from typing import Any, Optional
 class RuntimeError(Exception):  # noqa: A001 - deliberately mirrors runtime::RuntimeError
     """Turn-level failure. Shadows the builtin inside this package on purpose."""
 
-    def __init__(self, message: str) -> None:
+    def __init__(self, message: str, partial_text: str = "") -> None:
         super().__init__(message)
         self.message = message
+        # Text the provider had already streamed before the failure. Kept so a
+        # timeout mid-generation does not silently discard minutes of output.
+        self.partial_text = partial_text
 
 
 @dataclass

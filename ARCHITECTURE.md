@@ -147,7 +147,17 @@ Two functions, cleanly split:
 | `message_stop` | Stream complete |
 
 `build_assistant_message()` folds that stream into a single
-`ConversationMessage` plus an optional `Usage` record. It also strips `<think>`
+`ConversationMessage` plus an optional `Usage` record. If the provider breaks
+mid-stream it attaches whatever text had already arrived to the raised error as
+`partial_text`, so a turn that dies three minutes into generation does not throw
+that output away.
+
+Two timeout paths exist and they raise different exceptions. A *connect*
+timeout surfaces as `urllib.error.URLError`; a *read* timeout — the provider
+accepted the request then stopped sending — raises a bare `TimeoutError`. Both
+are converted to `RuntimeError` with distinct messages, because they mean
+different things: one is "the service is not there", the other is "the model is
+probably still thinking". The ceiling is `--request-timeout`, default 900s. It also strips `<think>`
 blocks, which small reasoning models emit and which shouldn't reach the user.
 
 The fold produces a list of `ContentBlock`s, and this is the branch point of the

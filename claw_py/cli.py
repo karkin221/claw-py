@@ -12,7 +12,12 @@ from pathlib import Path
 from typing import Any
 
 from .agents import AGENT_SPECS, AgentConfig, build_tool_executor
-from .api import DEFAULT_BASE_URL, DEFAULT_MODEL, ApiClient
+from .api import (
+    DEFAULT_BASE_URL,
+    DEFAULT_MODEL,
+    DEFAULT_REQUEST_TIMEOUT,
+    ApiClient,
+)
 from .compact import CompactionConfig
 from .conversation import ConversationRuntime
 from .mcp import McpError, McpServerManager, load_mcp_config
@@ -130,7 +135,11 @@ def build_runtime(args: argparse.Namespace) -> ConversationRuntime:
         client_factory = routed_client_factory(args.model, on_route=announce_route)
     else:
         def client_factory(model: str) -> ApiClient:
-            return ApiClient(model=model or args.model, base_url=args.base_url)
+            return ApiClient(
+                model=model or args.model,
+                base_url=args.base_url,
+                request_timeout=args.request_timeout,
+            )
 
     # MCP servers start before tool assembly so their tools join the registry
     # like any other, and inherit the same hook and permission pipeline.
@@ -268,6 +277,17 @@ def render_summary(runtime: ConversationRuntime, summary: Any) -> None:
     print(f"\n{line}", file=sys.stderr)
 
 
+def report_error(error: RuntimeError) -> None:
+    print(f"\nerror: {error.message}", file=sys.stderr)
+    partial = getattr(error, "partial_text", "")
+    if partial:
+        print(
+            f"\n[the model had produced {len(partial)} characters before this; "
+            "shown above and recorded in the trace]",
+            file=sys.stderr,
+        )
+
+
 def shutdown(runtime: ConversationRuntime) -> None:
     manager = getattr(runtime, "mcp_manager", None)
     if manager is not None:
@@ -287,6 +307,12 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--cwd", default=".")
     parser.add_argument("--max-iterations", type=int, default=12)
+    parser.add_argument(
+        "--request-timeout",
+        type=float,
+        default=DEFAULT_REQUEST_TIMEOUT,
+        help="seconds to wait on one provider request (default %(default)s)",
+    )
     parser.add_argument("--compact-threshold", type=int, default=3000)
     parser.add_argument("--trace", default=None, help="write JSONL trace to this path")
     parser.add_argument(
@@ -366,7 +392,7 @@ def main(argv: list[str] | None = None) -> int:
         try:
             summary = runtime.run_turn(" ".join(args.prompt), prompter)
         except RuntimeError as error:
-            print(f"\nerror: {error.message}", file=sys.stderr)
+            report_error(error)
             return 1
         finally:
             shutdown(runtime)
@@ -392,7 +418,7 @@ def main(argv: list[str] | None = None) -> int:
         try:
             summary = runtime.run_turn(user_input, prompter)
         except RuntimeError as error:
-            print(f"\nerror: {error.message}", file=sys.stderr)
+            report_error(error)
             continue
         render_summary(runtime, summary)
 

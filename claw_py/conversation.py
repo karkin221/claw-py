@@ -563,6 +563,11 @@ class ConversationRuntime:
         )
 
     def record_turn_failed(self, iterations: int, error: Exception) -> None:
+        partial = getattr(error, "partial_text", "")
         self.session_tracer.emit(
-            "turn_failed", iteration=iterations, error=str(error)
+            "turn_failed",
+            iteration=iterations,
+            error=str(error),
+            partial_chars=len(partial),
+            partial_text=partial[:2000],
         )
