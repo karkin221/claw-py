@@ -8,6 +8,7 @@ JSON-RPC transport is exercised rather than mocked. Still no network.
 
 from __future__ import annotations
 
+import json
 import sys
 import tempfile
 import threading
@@ -1102,3 +1103,276 @@ class ProviderFailureTests(unittest.TestCase):
 
         self.assertEqual(ApiClient().request_timeout, DEFAULT_REQUEST_TIMEOUT)
         self.assertEqual(ApiClient(request_timeout=42).request_timeout, 42)
+
+
+class ShippedTraceTests(unittest.TestCase):
+    """The README case study cites this trace. If replay breaks, the docs lie."""
+
+    TRACE = Path(__file__).resolve().parent.parent / "docs" / "traces" / "astar-qwen3-14b.jsonl"
+
+    def test_the_trace_ships(self) -> None:
+        self.assertTrue(self.TRACE.is_file())
+
+    def test_it_replays(self) -> None:
+        from claw_py.persistence import replay_session
+
+        session = replay_session(self.TRACE)
+        # 20 messages were appended; 5 compactions leave 6. The replayed
+        # session is what the model last saw, not the full history.
+        self.assertEqual(len(session.messages), 6)
+        self.assertEqual(session.messages[0].role, "user")
+        self.assertIn("[compacted history]", session.messages[0].text())
+
+    def test_environment_is_recoverable(self) -> None:
+        from claw_py.persistence import replay_environment
+
+        env = replay_environment(self.TRACE)
+        self.assertEqual(env.model, "qwen3:14b")
+        self.assertEqual(env.permission_mode, "workspace-write")
+        self.assertEqual(len(env.tool_names), 8)
+
+    def test_the_numbers_the_readme_quotes(self) -> None:
+        import json as _json
+
+        events = [_json.loads(line) for line in self.TRACE.read_text().splitlines() if line.strip()]
+        completed = [e for e in events if e["kind"] == "turn_completed"][0]
+        self.assertEqual(completed["iterations"], 10)
+        self.assertEqual(completed["tool_results"], 9)
+        self.assertEqual(completed["input_tokens"], 33902)
+        self.assertEqual(completed["output_tokens"], 19692)
+
+        compactions = [e for e in events if e["kind"] == "auto_compaction"]
+        self.assertEqual(len(compactions), 5)
+        # three left history still above the 3000 threshold
+        self.assertEqual(sum(1 for c in compactions if c["after_tokens"] > 3000), 2)
+
+        failures = [e for e in events if e["kind"] == "tool_finished" and e["is_error"]]
+        self.assertEqual(len(failures), 3)
+        self.assertTrue(all(f["tool_name"] == "edit_file" for f in failures))
+
+    def test_the_first_summary_claims_work_that_never_happened(self) -> None:
+        """The README's central claim, asserted against the trace."""
+        import json as _json
+
+        events = [_json.loads(line) for line in self.TRACE.read_text().splitlines() if line.strip()]
+        first_summary = [e for e in events if e["kind"] == "auto_compaction"][0]["summary"]
+        self.assertIn("Benchmarked", first_summary)
+        self.assertIn("markdown report", first_summary)
+
+        # ...yet only one file was ever written, and it is a .py
+        writes = [
+            block["input"]["path"]
+            for e in events
+            if e["kind"] == "message_appended"
+            for block in e["message"]["blocks"]
+            if block["kind"] == "tool_use" and block["name"] == "write_file"
+        ]
+        self.assertTrue(all(p.endswith(".py") for p in writes))
+        self.assertEqual(len({p.rsplit("/", 1)[-1] for p in writes}), 1)
+
+    def test_an_edit_was_repeated_after_compaction(self) -> None:
+        import json as _json
+
+        events = [_json.loads(line) for line in self.TRACE.read_text().splitlines() if line.strip()]
+        edits = [
+            (block["input"].get("old_str", ""), block["input"].get("new_str", ""))
+            for e in events
+            if e["kind"] == "message_appended"
+            for block in e["message"]["blocks"]
+            if block["kind"] == "tool_use" and block["name"] == "edit_file"
+        ]
+        self.assertGreater(len(edits), len(set(edits)))  # at least one exact repeat
+
+
+def _call(index, name, args):
+    from claw_py.types import ContentBlock
+
+    return ConversationMessage(
+        role="assistant", blocks=[ContentBlock.tool_use(f"c{index}", name, args)]
+    )
+
+
+def _result(index, name, text, error=False):
+    return ConversationMessage.tool_result(f"c{index}", name, text, error)
+
+
+class CompactionCorrectnessTests(unittest.TestCase):
+    """Four failure modes observed in a real trace, each now prevented."""
+
+    REQUEST = (
+        "Implement an A* pathfinding visualizer.\n\nRequirements:\n"
+        "- Tkinter GUI\n- Compare BFS, Dijkstra, and A*\n"
+        "- Benchmark each algorithm\n- Produce a markdown report."
+    )
+
+    def _session(self, rounds: int = 4, payload: int = 9000):
+        session = Session()
+        session.push_user_text(self.REQUEST)
+        for index in range(1, rounds + 1):
+            session.push_message(
+                _call(index, "write_file", {"path": f"f{index}.py", "content": "x" * payload})
+            )
+            session.push_message(
+                _result(index, "write_file", f"wrote {payload} chars to f{index}.py")
+            )
+        return session
+
+    def test_the_original_request_is_never_dropped(self) -> None:
+        from claw_py.compact import CompactionConfig, compact_session
+
+        session = self._session()
+        compact_session(
+            session, CompactionConfig(threshold_tokens=4000, keep_last=4), lambda s, u: "notes"
+        )
+        self.assertIn("markdown report", session.messages[0].text())
+        self.assertEqual(session.messages[0].role, "user")
+
+    def test_the_request_survives_repeated_compaction(self) -> None:
+        from claw_py.compact import CompactionConfig, compact_session
+
+        config = CompactionConfig(threshold_tokens=4000, keep_last=4)
+        session = self._session()
+        for round_number in range(3):
+            compact_session(session, config, lambda s, u: f"notes {round_number}")
+            for index in range(5, 9):
+                session.push_message(
+                    _call(index, "write_file", {"path": "g.py", "content": "y" * 9000})
+                )
+                session.push_message(_result(index, "write_file", "wrote 9000 chars"))
+        self.assertIn("markdown report", session.messages[0].text())
+
+    def test_one_pass_gets_under_the_threshold(self) -> None:
+        """It used to compact, stay over, and fire again next iteration."""
+        from claw_py.compact import (
+            CompactionConfig,
+            compact_session,
+            estimate_session_tokens,
+            should_compact,
+        )
+
+        session = self._session(rounds=4, payload=13000)
+        config = CompactionConfig(threshold_tokens=8000, keep_last=6)
+        self.assertTrue(should_compact(session, config))
+        compact_session(session, config, lambda s, u: "notes")
+        self.assertLessEqual(estimate_session_tokens(session), config.threshold_tokens)
+        self.assertFalse(should_compact(session, config))
+
+    def test_oversized_tool_payloads_are_elided_from_retained_history(self) -> None:
+        from claw_py.compact import CompactionConfig, compact_session
+
+        session = self._session(rounds=4, payload=13000)
+        compact_session(
+            session, CompactionConfig(threshold_tokens=8000, keep_last=6), lambda s, u: "notes"
+        )
+        wire = json.dumps([m.to_wire() for m in session.messages])
+        self.assertIn("elided by compaction", wire)
+        self.assertNotIn("x" * 5000, wire)
+
+    def test_elision_keeps_small_arguments_intact(self) -> None:
+        from claw_py.compact import elide_large_tool_args
+
+        message = _call(1, "edit_file", {"path": "a.py", "old_str": "short", "new_str": "also short"})
+        self.assertEqual(elide_large_tool_args(message).tool_uses()[0].input["old_str"], "short")
+
+    def test_notes_are_extended_not_resummarised(self) -> None:
+        from claw_py.compact import CompactionConfig, compact_session
+
+        seen: list = []
+
+        def summarize(system_prompt, user_text):
+            seen.append(user_text)
+            return f"CONFIRMED: round {len(seen)}"
+
+        config = CompactionConfig(threshold_tokens=4000, keep_last=4)
+        session = self._session()
+        compact_session(session, config, summarize)
+        for index in range(5, 9):
+            session.push_message(_call(index, "write_file", {"path": "g.py", "content": "y" * 9000}))
+            session.push_message(_result(index, "write_file", "wrote 9000 chars"))
+        compact_session(session, config, summarize)
+
+        self.assertEqual(len(seen), 2)
+        self.assertIn("EXISTING NOTES", seen[1])
+        self.assertIn("do not rewrite", seen[1])
+        # the previous note is passed as notes, never re-fed as transcript
+        self.assertNotIn("[compacted history]", seen[1].split("NEW TRANSCRIPT")[-1])
+
+    def test_the_summary_prompt_forbids_inferring_completion(self) -> None:
+        from claw_py.compact import SUMMARY_SYSTEM_PROMPT
+
+        self.assertIn("NOT evidence", SUMMARY_SYSTEM_PROMPT)
+        self.assertIn("Never invent", SUMMARY_SYSTEM_PROMPT)
+        self.assertIn("CONFIRMED", SUMMARY_SYSTEM_PROMPT)
+
+    def test_transcript_marks_failures_for_the_summariser(self) -> None:
+        from claw_py.compact import build_transcript
+
+        transcript = build_transcript([
+            _call(1, "edit_file", {"path": "a.py"}),
+            _result(1, "edit_file", "old_str not found in file", True),
+        ])
+        self.assertIn("FAILED", transcript)
+        self.assertIn("old_str not found", transcript)
+
+    def test_tool_results_are_never_orphaned_from_their_call(self) -> None:
+        from claw_py.compact import CompactionConfig, compact_session
+
+        session = self._session(rounds=5)
+        compact_session(
+            session, CompactionConfig(threshold_tokens=3000, keep_last=3), lambda s, u: "notes"
+        )
+        roles = [m.role for m in session.messages]
+        for index, role in enumerate(roles):
+            if role == "tool":
+                self.assertEqual(roles[index - 1], "assistant", f"orphaned tool at {index}")
+
+
+class ContextWindowTests(unittest.TestCase):
+    """Ollama defaults to 4096 tokens and truncates silently past it."""
+
+    def test_num_ctx_is_sent(self) -> None:
+        import urllib.request
+
+        from claw_py.api import DEFAULT_NUM_CTX, ApiClient
+        from claw_py.types import ApiRequest
+
+        captured: dict = {}
+
+        class FakeResponse:
+            status = 200
+
+            def __enter__(self):
+                return iter(())
+
+            def __exit__(self, *args):
+                return False
+
+        def fake_urlopen(req, timeout=None):
+            captured.update(json.loads(req.data))
+            return FakeResponse()
+
+        original = urllib.request.urlopen
+        urllib.request.urlopen = fake_urlopen
+        try:
+            client = ApiClient()
+            list(client.stream(ApiRequest("sys", [ConversationMessage.user_text("hi")])))
+        finally:
+            urllib.request.urlopen = original
+
+        self.assertEqual(captured["options"]["num_ctx"], DEFAULT_NUM_CTX)
+        self.assertGreater(DEFAULT_NUM_CTX, 4096)
+
+    def test_num_ctx_is_configurable(self) -> None:
+        from claw_py.api import ApiClient
+
+        self.assertEqual(ApiClient(num_ctx=32768).num_ctx, 32768)
+
+    def test_threshold_defaults_to_half_the_window(self) -> None:
+        """A threshold above the window means the server truncates before
+        compaction ever fires, so the two must stay coupled."""
+        from claw_py.api import DEFAULT_NUM_CTX
+        from claw_py.compact import CompactionConfig
+
+        derived = max(2000, DEFAULT_NUM_CTX // 2)
+        self.assertEqual(derived, CompactionConfig().threshold_tokens)
+        self.assertLess(derived, DEFAULT_NUM_CTX)

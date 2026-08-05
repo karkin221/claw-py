@@ -23,6 +23,10 @@ DEFAULT_MODEL = "qwen3:4b"
 # can hold a socket open for many minutes; the previous 300s was reached in
 # practice, so this is both larger and configurable.
 DEFAULT_REQUEST_TIMEOUT = 900.0
+# Ollama defaults to a 4096-token window and truncates silently past it. A
+# harness that manages context must set this explicitly, or its careful
+# accounting is undone by the server dropping tokens it never hears about.
+DEFAULT_NUM_CTX = 16384
 
 
 class ApiClient:
@@ -35,10 +39,12 @@ class ApiClient:
         tool_specs: list[dict[str, Any]] | None = None,
         temperature: float = 0.0,
         request_timeout: float = DEFAULT_REQUEST_TIMEOUT,
+        num_ctx: int = DEFAULT_NUM_CTX,
     ) -> None:
         self.model = model
         self.base_url = base_url.rstrip("/")
         self.request_timeout = request_timeout
+        self.num_ctx = num_ctx
         self.tool_specs = tool_specs or []
         self.temperature = temperature
         self._call_counter = 0
@@ -68,7 +74,7 @@ class ApiClient:
             "model": self.model,
             "messages": messages,
             "stream": True,
-            "options": {"temperature": self.temperature},
+            "options": {"temperature": self.temperature, "num_ctx": self.num_ctx},
         }
         if self.tool_specs:
             payload["tools"] = self.tool_specs

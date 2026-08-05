@@ -207,6 +207,40 @@ undercounted a real file-writing session by about 6x (114 estimated tokens
 against a ~660-token payload), so the threshold never tripped on exactly the
 workload that grows history fastest.
 
+Compaction is the most failure-prone stage in the harness, and four of its
+guarantees exist because a real run broke without them.
+
+**The original request is pinned.** `pinned_count()` keeps `messages[0]` when
+it is the user's turn, and it is never part of the summarised head. Without
+this, a long turn eventually discards the requirements and the agent works from
+a paraphrase of them.
+
+**Summaries are evidence-bounded.** A summariser asked for "what was done",
+handed a transcript that opens with a requirements list, will report the
+requirements as accomplishments. `SUMMARY_SYSTEM_PROMPT` now demands a tool
+result as evidence for any completion claim and forbids inventing open issues,
+and `build_transcript` marks failed tool results `[FAILED]` so they are hard to
+miss.
+
+**Notes are extended, not re-summarised.** Previous notes are passed to the
+summariser separately with an instruction not to rewrite them, and
+`is_compaction_note()` filters them out of the transcript. Feeding a summary
+back through a summariser degrades it into nonsense within a few rounds.
+
+**One pass gets under the threshold.** `choose_split()` simulates the result
+before spending a model call, walking the split forward until the projection
+fits. `elide_large_tool_args()` replaces oversized tool arguments in the
+retained tail with a placeholder — a 13KB `write_file` payload re-sent every
+iteration is the main driver of context growth and the most recoverable thing
+in the history, since the file is on disk. Together these stop compaction
+firing repeatedly without making progress.
+
+**The threshold is coupled to the context window.** `--compact-threshold`
+defaults to half of `--num-ctx`. This matters more than it looks: Ollama
+defaults to a 4096-token window and truncates silently past it, so a harness
+that does not set `num_ctx` explicitly can have its careful accounting undone
+by a server quietly dropping tokens. `ApiClient` now always sends it.
+
 `compact_session` splits the history, asks the model to summarise the older
 portion, and replaces it with that summary plus a continuation message. It never
 splits in the middle of an assistant/tool-result pair — that would orphan a tool

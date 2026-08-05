@@ -15,6 +15,7 @@ from .agents import AGENT_SPECS, AgentConfig, build_tool_executor
 from .api import (
     DEFAULT_BASE_URL,
     DEFAULT_MODEL,
+    DEFAULT_NUM_CTX,
     DEFAULT_REQUEST_TIMEOUT,
     ApiClient,
 )
@@ -139,6 +140,7 @@ def build_runtime(args: argparse.Namespace) -> ConversationRuntime:
                 model=model or args.model,
                 base_url=args.base_url,
                 request_timeout=args.request_timeout,
+                num_ctx=args.num_ctx,
             )
 
     # MCP servers start before tool assembly so their tools join the registry
@@ -313,7 +315,19 @@ def main(argv: list[str] | None = None) -> int:
         default=DEFAULT_REQUEST_TIMEOUT,
         help="seconds to wait on one provider request (default %(default)s)",
     )
-    parser.add_argument("--compact-threshold", type=int, default=3000)
+    parser.add_argument(
+        "--num-ctx",
+        type=int,
+        default=DEFAULT_NUM_CTX,
+        help="model context window (default %(default)s). Ollama defaults to "
+        "4096 and truncates silently past it, so this is set explicitly.",
+    )
+    parser.add_argument(
+        "--compact-threshold",
+        type=int,
+        default=None,
+        help="compact above this many tokens (default: half of --num-ctx)",
+    )
     parser.add_argument("--trace", default=None, help="write JSONL trace to this path")
     parser.add_argument(
         "--mcp-config", default=None, help="path to a .mcp.json server config"
@@ -378,6 +392,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("-v", "--verbose", action="store_true", help="echo trace events")
     args = parser.parse_args(argv)
+    if args.compact_threshold is None:
+        # Coupled deliberately: a threshold larger than the window means the
+        # server truncates before compaction ever fires, and a tiny threshold
+        # against a large window compacts for no reason.
+        args.compact_threshold = max(2000, args.num_ctx // 2)
 
     if args.list_sessions:
         if not args.trace:

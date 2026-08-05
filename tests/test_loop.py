@@ -265,20 +265,25 @@ class CompactionTests(unittest.TestCase):
         return session
 
     def test_threshold_gate(self) -> None:
+        config = CompactionConfig(threshold_tokens=3000, keep_last=4)
         small = Session()
         small.push_user_text("hi")
-        self.assertFalse(should_compact(small, CompactionConfig()))
-        self.assertTrue(should_compact(self._big_session(), CompactionConfig()))
+        self.assertFalse(should_compact(small, config))
+        self.assertTrue(should_compact(self._big_session(), config))
 
     def test_compaction_shrinks_history_and_records_it(self) -> None:
         session = self._big_session()
         before = estimate_session_tokens(session)
         result = compact_session(
-            session, CompactionConfig(keep_last=4), lambda sp, ut: "a summary"
+            session,
+            CompactionConfig(threshold_tokens=3000, keep_last=4),
+            lambda sp, ut: "a summary",
         )
         self.assertLess(estimate_session_tokens(session), before)
-        self.assertEqual(len(session.messages), 5)
+        # pinned original request + continuation note + retained tail
+        self.assertEqual(len(session.messages), 6)
         self.assertEqual(session.messages[0].role, "user")
+        self.assertIn("msg0", session.messages[0].text())  # the ORIGINAL request
         self.assertIsNotNone(result.record)
         self.assertEqual(session.compaction, result.record)
 
