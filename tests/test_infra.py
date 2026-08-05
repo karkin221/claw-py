@@ -1106,82 +1106,82 @@ class ProviderFailureTests(unittest.TestCase):
 
 
 class ShippedTraceTests(unittest.TestCase):
-    """The README case study cites this trace. If replay breaks, the docs lie."""
+    """The README case study cites these traces. If replay breaks, the docs lie."""
 
-    TRACE = Path(__file__).resolve().parent.parent / "docs" / "traces" / "astar-qwen3-14b.jsonl"
+    TRACES = Path(__file__).resolve().parent.parent / "docs" / "traces"
+    BEFORE = TRACES / "astar-before-fixes.jsonl"
+    AFTER = TRACES / "astar-after-fixes.jsonl"
 
-    def test_the_trace_ships(self) -> None:
-        self.assertTrue(self.TRACE.is_file())
+    def _events(self, path):
+        return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
 
-    def test_it_replays(self) -> None:
+    def test_both_traces_ship(self) -> None:
+        self.assertTrue(self.BEFORE.is_file())
+        self.assertTrue(self.AFTER.is_file())
+
+    def test_they_are_not_gitignored(self) -> None:
+        """*.jsonl is ignored; the shipped traces must be negated back in."""
+        ignore = (Path(__file__).resolve().parent.parent / ".gitignore").read_text()
+        self.assertIn("!docs/traces/*.jsonl", ignore)
+
+    def test_both_replay(self) -> None:
         from claw_py.persistence import replay_session
 
-        session = replay_session(self.TRACE)
-        # 20 messages were appended; 5 compactions leave 6. The replayed
-        # session is what the model last saw, not the full history.
-        self.assertEqual(len(session.messages), 6)
-        self.assertEqual(session.messages[0].role, "user")
-        self.assertIn("[compacted history]", session.messages[0].text())
+        self.assertGreater(len(replay_session(self.BEFORE).messages), 0)
+        after = replay_session(self.AFTER)
+        self.assertEqual(len(after.messages), 10)  # no compaction, nothing lost
+        self.assertIn("markdown report", after.messages[0].text())
 
-    def test_environment_is_recoverable(self) -> None:
+    def test_the_after_environment_is_recoverable(self) -> None:
         from claw_py.persistence import replay_environment
 
-        env = replay_environment(self.TRACE)
+        env = replay_environment(self.AFTER)
         self.assertEqual(env.model, "qwen3:14b")
         self.assertEqual(env.permission_mode, "workspace-write")
         self.assertEqual(len(env.tool_names), 8)
+        self.assertIn("command-line coding agent", env.system_prompt)
 
     def test_the_numbers_the_readme_quotes(self) -> None:
-        import json as _json
+        before = [e for e in self._events(self.BEFORE) if e["kind"] == "turn_completed"][0]
+        after = [e for e in self._events(self.AFTER) if e["kind"] == "turn_completed"][0]
 
-        events = [_json.loads(line) for line in self.TRACE.read_text().splitlines() if line.strip()]
-        completed = [e for e in events if e["kind"] == "turn_completed"][0]
-        self.assertEqual(completed["iterations"], 10)
-        self.assertEqual(completed["tool_results"], 9)
-        self.assertEqual(completed["input_tokens"], 33902)
-        self.assertEqual(completed["output_tokens"], 19692)
+        self.assertEqual((before["iterations"], after["iterations"]), (10, 5))
+        self.assertEqual((before["tool_results"], after["tool_results"]), (9, 4))
+        self.assertEqual((before["input_tokens"], after["input_tokens"]), (33902, 23798))
+        self.assertEqual((before["output_tokens"], after["output_tokens"]), (19692, 13095))
 
-        compactions = [e for e in events if e["kind"] == "auto_compaction"]
-        self.assertEqual(len(compactions), 5)
-        # three left history still above the 3000 threshold
-        self.assertEqual(sum(1 for c in compactions if c["after_tokens"] > 3000), 2)
+    def test_compaction_was_eliminated(self) -> None:
+        """The headline claim: 5 compactions before, none after."""
+        before = [e for e in self._events(self.BEFORE) if e["kind"] == "auto_compaction"]
+        after = [e for e in self._events(self.AFTER) if e["kind"] == "auto_compaction"]
+        self.assertEqual(len(before), 5)
+        self.assertEqual(len(after), 0)
 
-        failures = [e for e in events if e["kind"] == "tool_finished" and e["is_error"]]
-        self.assertEqual(len(failures), 3)
-        self.assertTrue(all(f["tool_name"] == "edit_file" for f in failures))
+    def test_failed_tool_calls_dropped(self) -> None:
+        def failures(path):
+            return [
+                e for e in self._events(path)
+                if e["kind"] == "tool_finished" and e["is_error"]
+            ]
 
-    def test_the_first_summary_claims_work_that_never_happened(self) -> None:
-        """The README's central claim, asserted against the trace."""
-        import json as _json
+        self.assertEqual(len(failures(self.BEFORE)), 3)
+        self.assertEqual(len(failures(self.AFTER)), 1)
 
-        events = [_json.loads(line) for line in self.TRACE.read_text().splitlines() if line.strip()]
-        first_summary = [e for e in events if e["kind"] == "auto_compaction"][0]["summary"]
-        self.assertIn("Benchmarked", first_summary)
-        self.assertIn("markdown report", first_summary)
+    def test_the_after_run_never_exceeded_the_context_window(self) -> None:
+        from claw_py.api import DEFAULT_NUM_CTX
+        from claw_py.compact import estimate_session_tokens
+        from claw_py.persistence import deserialize_message
 
-        # ...yet only one file was ever written, and it is a .py
-        writes = [
-            block["input"]["path"]
-            for e in events
-            if e["kind"] == "message_appended"
-            for block in e["message"]["blocks"]
-            if block["kind"] == "tool_use" and block["name"] == "write_file"
-        ]
-        self.assertTrue(all(p.endswith(".py") for p in writes))
-        self.assertEqual(len({p.rsplit("/", 1)[-1] for p in writes}), 1)
+        session = Session()
+        peak = 0
+        for event in self._events(self.AFTER):
+            if event["kind"] == "assistant_iteration":
+                peak = max(peak, estimate_session_tokens(session) + 102 + 647)
+            elif event["kind"] == "message_appended":
+                session.push_message(deserialize_message(event["message"]))
 
-    def test_an_edit_was_repeated_after_compaction(self) -> None:
-        import json as _json
-
-        events = [_json.loads(line) for line in self.TRACE.read_text().splitlines() if line.strip()]
-        edits = [
-            (block["input"].get("old_str", ""), block["input"].get("new_str", ""))
-            for e in events
-            if e["kind"] == "message_appended"
-            for block in e["message"]["blocks"]
-            if block["kind"] == "tool_use" and block["name"] == "edit_file"
-        ]
-        self.assertGreater(len(edits), len(set(edits)))  # at least one exact repeat
+        self.assertLess(peak, DEFAULT_NUM_CTX)
+        self.assertGreater(peak, 4096)  # would have been truncated by the old default
 
 
 def _call(index, name, args):

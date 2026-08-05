@@ -46,7 +46,8 @@ turn start
                                         (loop back to assemble request)
 ```
 
-**[→ Read `ARCHITECTURE.md` for what each stage does, line by line.](ARCHITECTURE.md)**
+**[→ `ARCHITECTURE.md` — what each stage does, line by line.](ARCHITECTURE.md)**
+**[→ Case study — a real turn, traced end to end, with charts.](#case-study-one-turn-end-to-end)**
 
 ---
 
@@ -236,7 +237,7 @@ retrieved text as data, and both go through the normal permission gate.
 python -m unittest discover -s tests -v
 ```
 
-187 tests, no network, no model. They cover the loop, the iteration cap, tool
+189 tests, no network, no model. They cover the loop, the iteration cap, tool
 failures, all five permission modes, hook rewrite/deny/override, post-hook error
 flipping, compaction, the session health probe, subagent tool restriction, mode
 narrowing, depth limiting, hook inheritance, context isolation, the router's
@@ -244,6 +245,148 @@ fragmented-tool-call reassembly, MCP handshake/dispatch/concurrency against a
 real subprocess, trace replay including compaction and truncated writes, and
 parallel dispatch ordering guarantees, every permission-decision source, and three regressions
 found by reading a real production trace (see the commit log).
+
+---
+
+## Case study: one turn, end to end
+
+Two real runs of the same prompt on the same model, both shipped so you can
+replay them:
+[`docs/traces/astar-before-fixes.jsonl`](docs/traces/astar-before-fixes.jsonl)
+and
+[`docs/traces/astar-after-fixes.jsonl`](docs/traces/astar-after-fixes.jsonl).
+
+```bash
+python -m claw_py.cli --trace trace.jsonl -v --model qwen3:14b \
+  "Implement an A* pathfinding visualizer.
+
+Requirements:
+- Tkinter GUI
+- Interactive obstacle placement
+- Adjustable grid size
+- Step-by-step visualization
+- Compare BFS, Dijkstra, and A*
+- Benchmark each algorithm on random maps
+- Produce a markdown report summarizing runtime results."
+```
+
+Inspect either one:
+
+```bash
+python -m claw_py.cli --trace docs/traces/astar-after-fixes.jsonl --list-sessions
+python -c "
+from pathlib import Path
+from claw_py.persistence import replay_environment
+e = replay_environment(Path('docs/traces/astar-after-fixes.jsonl'))
+print(e.model, e.permission_mode, e.tool_names); print(e.system_prompt)"
+```
+
+### What goes over the wire
+
+Every request carries three parts, and only one of them grows:
+
+| Part | Size | Changes? |
+|---|---|---|
+| System prompt | 102 tokens | Never — built once at startup by `prompt.py` |
+| Tools array | 647 tokens | Never — 8 JSON schemas, re-sent verbatim |
+| Message history | 81 → 7,570 tokens | Every iteration |
+
+The system prompt is **not** the user's message. It is generated, and never
+enters `session.messages` — which is why the trace has 10 `message_appended`
+events and none of them is a system message. It is recorded separately by
+`session_started`, which is how the command above can print it.
+
+Note the tools array is **6× larger than the system prompt**. It is the biggest
+fixed cost in the loop and the part people forget to count.
+
+<p align="center">
+  <img src="docs/case-study-payload.svg" alt="Request composition across five iterations" width="680">
+</p>
+
+The dashed line is the important one. **Ollama defaults to a 4096-token context
+window and truncates silently past it.** Requests 3, 4 and 5 all exceed it, so
+without `--num-ctx` the server would have been quietly discarding part of every
+one of them while the harness believed it was managing context. `ApiClient`
+now always sends `num_ctx` (default 16384) and `--compact-threshold` defaults
+to half of it.
+
+Peak history was 7,570 tokens against the 8,192 threshold, so **compaction
+never fired** — the whole turn ran on unmodified history.
+
+### The shape of the turn
+
+<p align="center">
+  <img src="docs/case-study-timeline.svg" alt="The five-iteration turn mapped to stages" width="680">
+</p>
+
+Read it against [the loop diagram](#the-architecture-in-one-picture). Each
+iteration is one pass: assemble request, stream, check for tool calls, run the
+tool pipeline, loop. Iteration 5 returns no tool calls, `pending_tool_uses` is
+empty, and Stage 5 breaks.
+
+There is no stop signal to interpret. **The absence of tool calls is the
+completion signal.**
+
+### Where the time went
+
+<p align="center">
+  <img src="docs/case-study-time.svg" alt="Generation seconds per iteration" width="680">
+</p>
+
+1,183 seconds total, of which 1,183 is generation — tool execution is
+effectively free at this scale.
+
+Iteration 2 is the one to study: **516 seconds producing an `edit_file` call
+that failed instantly** with `old_str not found in file`. The model had written
+the file in iteration 1 and then tried to edit it using a 2,364-character
+`old_str` reconstructed from memory rather than re-read from disk. Iteration 3
+re-read the file (56s) and iteration 4 applied a corrected 278-character
+`old_str` successfully.
+
+So **48% of the turn was one avoidable mistake and its recovery.** The system
+prompt already says *"Prefer reading before writing"*; a 14B model treats that
+as a suggestion.
+
+Also note `text_chars: 0` on iterations 1 through 4. The model emitted **no
+prose at all** — only tool calls. The 13,095 output tokens were almost entirely
+`<think>` blocks that `strip_reasoning()` discarded before storage. The model
+re-derives its reasoning every iteration, because none of it is in the history
+it gets back.
+
+### What the fixes changed
+
+The same prompt, same model, before and after the context fixes:
+
+| | before | after | |
+|---|---|---|---|
+| iterations | 10 | **5** | −50% |
+| wall clock | 2,172s | **1,183s** | −46% |
+| tool calls | 9 | **4** | −56% |
+| failed calls | 3 | **1** | −67% |
+| compactions | 5 | **0** | eliminated |
+| input tokens | 33,902 | **23,798** | −30% |
+| output tokens | 19,692 | **13,095** | −33% |
+
+The before-run compacted five times, twice failing to get under the threshold,
+and one compaction dropped the original requirements — after which the
+summariser reported them as completed work the agent had never done. None of
+that happens now: the request is pinned, summaries are evidence-bounded, and
+one compaction pass gets under the line. See
+[ARCHITECTURE.md](ARCHITECTURE.md#stage-4--auto-compact-check).
+
+### What this teaches
+
+| Observation | Lesson |
+|---|---|
+| Requests exceeded the server's default window | A harness that manages context must set `num_ctx`, or the server undoes its accounting invisibly |
+| The tools array is 6× the system prompt | Count the tools array. `--no-subagents` saved ~90 tokens/request here |
+| 516s wasted on an edit built from memory | Read before edit. The cheapest fix is a `PreToolUse` hook that rejects `edit_file` on a file not read this turn |
+| 89% of output was discarded `<think>` | On reasoning models, most of what you pay for never reaches the history |
+| The turn ended by *not* calling a tool | There is no completion signal; the loop is the control flow |
+
+The architectural point: none of this was visible in the output. It took the
+trace — which exists because every stage emits an event at the point of action
+rather than being reconstructed afterwards.
 
 ---
 
@@ -255,7 +398,8 @@ claw-py/
 ├── ARCHITECTURE.md         stage-by-stage explanation of the loop
 ├── docs/
 │   ├── agent-loop.svg      the diagram above
-│   └── traces/             a real trace, used as a replay fixture
+│   ├── case-study-*.svg    charts for the case study
+│   └── traces/             two real traces, before and after the fixes
 ├── claw_py/
 │   ├── conversation.py     ← the whole architecture lives here
 │   ├── types.py            messages, blocks, session, usage

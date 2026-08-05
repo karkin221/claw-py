@@ -1,0 +1,64 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="680" height="392" viewBox="0 0 680 392" role="img">
+<title>Request composition per iteration</title><desc>Stacked input tokens across five requests: a fixed 102-token system prompt and 647-token tools array plus growing history, against a dashed line at Ollama's old 4096-token default window.</desc>
+<style>
+  svg { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; }
+  .ts { font-size: 12px; font-weight: 400; fill: #5F5E5A; }
+  .grid { stroke: #D3D1C7; stroke-width: 0.5; }
+  .axis { stroke: #B4B2A9; stroke-width: 1; }
+  .ref { stroke: #eb6834; stroke-width: 2; stroke-dasharray: 6 4; fill: none; }
+  .sys { fill: #888780; } .tools { fill: #1baf7a; } .hist { fill: #2a78d6; }
+  .ok { fill: #2a78d6; } .bad { fill: #eb6834; }
+  @media (prefers-color-scheme: dark) {
+    .ts { fill: #B4B2A9; } .grid { stroke: #383835; } .axis { stroke: #5F5E5A; }
+    .hist, .ok { fill: #3987e5; } .bad { fill: #d95926; } .tools { fill: #199e70; }
+  }
+</style>
+<line class="grid" x1="70" y1="290.0" x2="640" y2="290.0"/>
+<text class="ts" x="60" y="290.0" text-anchor="end" dominant-baseline="central">0</text>
+<line class="grid" x1="70" y1="244.0" x2="640" y2="244.0"/>
+<text class="ts" x="60" y="244.0" text-anchor="end" dominant-baseline="central">1800</text>
+<line class="grid" x1="70" y1="198.0" x2="640" y2="198.0"/>
+<text class="ts" x="60" y="198.0" text-anchor="end" dominant-baseline="central">3600</text>
+<line class="grid" x1="70" y1="152.0" x2="640" y2="152.0"/>
+<text class="ts" x="60" y="152.0" text-anchor="end" dominant-baseline="central">5400</text>
+<line class="grid" x1="70" y1="106.0" x2="640" y2="106.0"/>
+<text class="ts" x="60" y="106.0" text-anchor="end" dominant-baseline="central">7200</text>
+<line class="grid" x1="70" y1="60.0" x2="640" y2="60.0"/>
+<text class="ts" x="60" y="60.0" text-anchor="end" dominant-baseline="central">9000</text>
+<line class="ref" x1="70" y1="185.3" x2="640" y2="185.3"/>
+<text class="ts" x="78" y="175.3" >old 4096 window</text>
+<text class="ts" x="70" y="40">input tokens</text>
+<rect class="sys" x="101.0" y="287.4" width="52" height="2.6" rx="3"/>
+<rect class="tools" x="101.0" y="270.9" width="52" height="16.5" rx="3"/>
+<rect class="hist" x="101.0" y="268.8" width="52" height="2.1" rx="3"/>
+<text class="ts" x="127.0" y="260.8" text-anchor="middle">830</text>
+<text class="ts" x="127.0" y="306" text-anchor="middle">1</text>
+<rect class="sys" x="215.0" y="287.4" width="52" height="2.6" rx="3"/>
+<rect class="tools" x="215.0" y="270.9" width="52" height="16.5" rx="3"/>
+<rect class="hist" x="215.0" y="208.8" width="52" height="62.0" rx="3"/>
+<text class="ts" x="241.0" y="200.8" text-anchor="middle">3177</text>
+<text class="ts" x="241.0" y="306" text-anchor="middle">2</text>
+<rect class="sys" x="329.0" y="287.4" width="52" height="2.6" rx="3"/>
+<rect class="tools" x="329.0" y="270.9" width="52" height="16.5" rx="3"/>
+<rect class="hist" x="329.0" y="143.7" width="52" height="127.1" rx="3"/>
+<text class="ts" x="355.0" y="135.7" text-anchor="middle">5723</text>
+<text class="ts" x="355.0" y="306" text-anchor="middle">3</text>
+<rect class="sys" x="443.0" y="287.4" width="52" height="2.6" rx="3"/>
+<rect class="tools" x="443.0" y="270.9" width="52" height="16.5" rx="3"/>
+<rect class="hist" x="443.0" y="115.3" width="52" height="155.6" rx="3"/>
+<text class="ts" x="469.0" y="107.3" text-anchor="middle">6837</text>
+<text class="ts" x="469.0" y="306" text-anchor="middle">4</text>
+<rect class="sys" x="557.0" y="287.4" width="52" height="2.6" rx="3"/>
+<rect class="tools" x="557.0" y="270.9" width="52" height="16.5" rx="3"/>
+<rect class="hist" x="557.0" y="77.4" width="52" height="193.5" rx="3"/>
+<text class="ts" x="583.0" y="69.4" text-anchor="middle">8319</text>
+<text class="ts" x="583.0" y="306" text-anchor="middle">5</text>
+<line class="axis" x1="70" y1="290" x2="640" y2="290"/>
+<text class="ts" x="355.0" y="328" text-anchor="middle">iteration</text>
+<rect class="sys" x="70" y="358" width="12" height="12" rx="3"/>
+<text class="ts" x="88" y="364" dominant-baseline="central">system 102</text>
+<rect class="tools" x="166" y="358" width="12" height="12" rx="3"/>
+<text class="ts" x="184" y="364" dominant-baseline="central">tools 647</text>
+<rect class="hist" x="255" y="358" width="12" height="12" rx="3"/>
+<text class="ts" x="273" y="364" dominant-baseline="central">history</text>
+</svg>

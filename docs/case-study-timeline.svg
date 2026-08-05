@@ -1,0 +1,56 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="680" height="486" viewBox="0 0 680 486" role="img">
+<title>The five-iteration turn, mapped to stages</title>
+<desc>Turn opens with a 284-character prompt. Iteration one writes an 8756-character file. Iteration two attempts an edit built from memory and fails. Iteration three re-reads the file. Iteration four applies a corrected edit. Iteration five returns no tool calls and the loop breaks.</desc>
+<style>
+  svg { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; }
+  .th { font-size: 14px; font-weight: 500; }
+  .ts { font-size: 12px; font-weight: 400; }
+  .arr { stroke: #5F5E5A; stroke-width: 1.5; fill: none; }
+  .lbl { fill: #5F5E5A; }
+  .c-gray rect, rect.c-gray { fill: #F1EFE8; stroke: #5F5E5A; }
+  .c-gray .th { fill: #444441; }
+  .c-purple rect, rect.c-purple { fill: #EEEDFE; stroke: #534AB7; }
+  .c-purple .th { fill: #3C3489; }
+  .c-coral rect, rect.c-coral { fill: #FAECE7; stroke: #993C1D; }
+  .c-coral .th { fill: #712B13; }
+  @media (prefers-color-scheme: dark) {
+    .arr { stroke: #B4B2A9; } .lbl { fill: #B4B2A9; }
+    .c-gray rect, rect.c-gray { fill: #444441; stroke: #B4B2A9; } .c-gray .th { fill: #D3D1C7; }
+    .c-purple rect, rect.c-purple { fill: #3C3489; stroke: #AFA9EC; } .c-purple .th { fill: #CECBF6; }
+    .c-coral rect, rect.c-coral { fill: #712B13; stroke: #F0997B; } .c-coral .th { fill: #F5C4B3; }
+  }
+</style>
+<g class="c-gray"><rect x="60" y="40" width="290" height="44" rx="8" stroke-width="0.5"/>
+<text class="th" x="76" y="62" dominant-baseline="central">turn opens</text></g>
+<text class="ts lbl" x="366" y="62" dominant-baseline="central">stage 1 · 284-char prompt pushed</text>
+<g class="c-purple"><rect x="60" y="96" width="290" height="44" rx="8" stroke-width="0.5"/>
+<text class="th" x="76" y="118" dominant-baseline="central">iteration 1 · write_file</text></g>
+<text class="ts lbl" x="366" y="118" dominant-baseline="central">830 tok in · 277s · wrote 8756 chars</text>
+<g class="c-coral"><rect x="60" y="152" width="290" height="44" rx="8" stroke-width="0.5"/>
+<text class="th" x="76" y="174" dominant-baseline="central">iteration 2 · edit_file</text></g>
+<text class="ts lbl" x="366" y="174" dominant-baseline="central">3177 tok in · 516s · old_str not found</text>
+<g class="c-purple"><rect x="60" y="208" width="290" height="44" rx="8" stroke-width="0.5"/>
+<text class="th" x="76" y="230" dominant-baseline="central">iteration 3 · read_file</text></g>
+<text class="ts lbl" x="366" y="230" dominant-baseline="central">5723 tok in · 56s · re-reads the file</text>
+<g class="c-purple"><rect x="60" y="264" width="290" height="44" rx="8" stroke-width="0.5"/>
+<text class="th" x="76" y="286" dominant-baseline="central">iteration 4 · edit_file</text></g>
+<text class="ts lbl" x="366" y="286" dominant-baseline="central">6837 tok in · 279s · edit applied</text>
+<g class="c-purple"><rect x="60" y="320" width="290" height="44" rx="8" stroke-width="0.5"/>
+<text class="th" x="76" y="342" dominant-baseline="central">iteration 5 · no tool calls</text></g>
+<text class="ts lbl" x="366" y="342" dominant-baseline="central">8319 tok in · 55s · stage 5 breaks</text>
+<g class="c-gray"><rect x="60" y="376" width="290" height="44" rx="8" stroke-width="0.5"/>
+<text class="th" x="76" y="398" dominant-baseline="central">turn completes</text></g>
+<text class="ts lbl" x="366" y="398" dominant-baseline="central">stage 11 · 23798 in / 13095 out</text>
+<line x1="205" y1="84" x2="205" y2="92" class="arr"/>
+<line x1="205" y1="140" x2="205" y2="148" class="arr"/>
+<line x1="205" y1="196" x2="205" y2="204" class="arr"/>
+<line x1="205" y1="252" x2="205" y2="260" class="arr"/>
+<line x1="205" y1="308" x2="205" y2="316" class="arr"/>
+<line x1="205" y1="364" x2="205" y2="372" class="arr"/>
+<rect class="c-purple" x="60" y="446" width="12" height="12" rx="3" stroke-width="0.5"/>
+<text class="ts lbl" x="78" y="452" dominant-baseline="central">tool call succeeded</text>
+<rect class="c-coral" x="230" y="446" width="12" height="12" rx="3" stroke-width="0.5"/>
+<text class="ts lbl" x="248" y="452" dominant-baseline="central">tool call failed</text>
+<rect class="c-gray" x="380" y="446" width="12" height="12" rx="3" stroke-width="0.5"/>
+<text class="ts lbl" x="398" y="452" dominant-baseline="central">turn boundary</text>
+</svg>
