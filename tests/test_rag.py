@@ -390,3 +390,101 @@ class ResearchSubagentTests(RagServerTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class BaseUrlTests(RagServerTestCase):
+    """`--rag-url 127.0.0.1:8001` failed with `unknown url type` before a socket
+    was ever opened, and the CLI reported it as the service being down.
+    """
+
+    def test_scheme_is_added_when_missing(self) -> None:
+        from claw_py.rag import normalize_base_url
+
+        self.assertEqual(normalize_base_url("127.0.0.1:8001"), "http://127.0.0.1:8001")
+        self.assertEqual(normalize_base_url("localhost:8000"), "http://localhost:8000")
+
+    def test_existing_scheme_is_preserved(self) -> None:
+        from claw_py.rag import normalize_base_url
+
+        self.assertEqual(
+            normalize_base_url("https://rag.internal/api"), "https://rag.internal/api"
+        )
+
+    def test_trailing_slash_is_stripped(self) -> None:
+        from claw_py.rag import normalize_base_url
+
+        self.assertEqual(normalize_base_url("http://x:1/"), "http://x:1")
+
+    def test_empty_falls_back_to_the_default(self) -> None:
+        from claw_py.rag import DEFAULT_BASE_URL, normalize_base_url
+
+        self.assertEqual(normalize_base_url(""), DEFAULT_BASE_URL)
+
+    def test_config_normalizes_on_construction(self) -> None:
+        self.assertEqual(
+            RagConfig(base_url="127.0.0.1:8001").base_url, "http://127.0.0.1:8001"
+        )
+
+    def test_scheme_less_url_actually_connects(self) -> None:
+        client = RagClient(RagConfig(base_url=f"127.0.0.1:{PORT}"))
+        reachable, reason = client.check()
+        self.assertTrue(reachable, reason)
+        self.assertTrue(client.search("cartel discipline"))
+
+
+class HealthReportingTests(unittest.TestCase):
+    def test_check_reports_the_real_reason(self) -> None:
+        ok, reason = RagClient(RagConfig(base_url="127.0.0.1:9", timeout=1)).check()
+        self.assertFalse(ok)
+        self.assertIn("refused", reason.lower())
+        self.assertIn("127.0.0.1:9", reason)
+
+    def test_check_does_not_require_json(self) -> None:
+        """A /health returning plain text still means alive."""
+        import threading
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+
+        class PlainText(BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def do_GET(self):  # noqa: N802
+                body = b"ok"
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        server = HTTPServer(("127.0.0.1", 8748), PlainText)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            ok, reason = RagClient(RagConfig(base_url="127.0.0.1:8748")).check()
+            self.assertTrue(ok, reason)
+        finally:
+            server.shutdown()
+            server.server_close()
+
+
+class RealEnvelopeTests(RagServerTestCase):
+    """The stand-in mirrors the real service's response shape."""
+
+    def test_envelope_matches_the_service(self) -> None:
+        import json as _json
+        import urllib.request
+
+        raw = _json.loads(
+            urllib.request.urlopen(
+                f"http://127.0.0.1:{PORT}/search?q=strait+of+hormuz&k=3"
+            ).read()
+        )
+        self.assertEqual(set(raw) >= {"query", "count", "results"}, True)
+        hit = raw["results"][0]
+        for field in ("chunk_id", "slug", "publication", "title", "author"):
+            self.assertIn(field, hit)
+
+    def test_citation_reconstructs_without_a_citation_field(self) -> None:
+        hits = self.client.search("strait of hormuz", k=3)
+        self.assertNotIn("citation", hits[0])
+        rendered = format_citation(hits[0])
+        self.assertIn("Alexander Campbell", rendered)
+        self.assertIn("A New Oil Era", rendered)

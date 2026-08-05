@@ -219,6 +219,7 @@ Against a real service (e.g. `substack-rag` on `127.0.0.1:8000`):
 
 ```bash
 python -m claw_py.cli --rag-url "what did Citrini say about leverage unwinds"
+python -m claw_py.cli --rag-url 127.0.0.1:8001 "..."  # scheme optional
 python -m claw_py.cli --rag-url --rag-auto "..."     # retrieve every turn
 python -m claw_py.cli --rag-url --rag-k 8 "..."      # more passages
 ```
@@ -233,7 +234,7 @@ retrieved text as data, and both go through the normal permission gate.
 python -m unittest discover -s tests -v
 ```
 
-154 tests, no network, no model. They cover the loop, the iteration cap, tool
+164 tests, no network, no model. They cover the loop, the iteration cap, tool
 failures, all five permission modes, hook rewrite/deny/override, post-hook error
 flipping, compaction, the session health probe, subagent tool restriction, mode
 narrowing, depth limiting, hook inheritance, context isolation, the router's

@@ -19,6 +19,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 
 CHUNKS = [
     {
+        "chunk_id": "campbellramble/a-new-oil-era#12",
         "slug": "a-new-oil-era",
         "title": "A New Oil Era",
         "author": "Alexander Campbell",
@@ -33,8 +34,10 @@ CHUNKS = [
         ),
     },
     {
+        "chunk_id": "campbellramble/a-new-oil-era#21",
         "slug": "a-new-oil-era",
         "title": "A New Oil Era",
+        "subtitle": "Capacity, not price",
         "author": "Alexander Campbell",
         "publication": "campbellramble",
         "date": "2026-04-29",
@@ -46,6 +49,7 @@ CHUNKS = [
         ),
     },
     {
+        "chunk_id": "citrini/all-along-the-ai-watchtower#4",
         "slug": "all-along-the-ai-watchtower",
         "title": "All Along the AI Watchtower",
         "author": "CitriniResearch",
@@ -60,6 +64,7 @@ CHUNKS = [
         ),
     },
     {
+        "chunk_id": "citrini/the-crowded-funds-problem#7",
         "slug": "the-crowded-funds-problem",
         "title": "The Crowded Funds Problem",
         "author": "CitriniResearch",
@@ -120,7 +125,6 @@ def search(params: dict) -> list[dict]:
         hit = dict(chunk)
         hit["score"] = score(chunk, query)
         hit["matched_by"] = "both" if hit["score"] > 1 else "fts"
-        hit["citation"] = f"{chunk['author']} — {chunk['title']} · {chunk['date']}"
         results.append(hit)
 
     results.sort(key=lambda h: -h["score"])
@@ -148,7 +152,9 @@ class Handler(BaseHTTPRequestHandler):
         elif parsed.path == "/stats":
             self._send({"documents": 3, "chunks": len(CHUNKS), "date_coverage": 1.0})
         elif parsed.path == "/search":
-            self._send({"results": search(params)})
+            query = params.get("q", [""])[0]
+            hits = search(params)
+            self._send({"query": query, "count": len(hits), "results": hits})
         elif parsed.path.startswith("/doc/"):
             slug = urllib.parse.unquote(parsed.path[len("/doc/"):])
             if slug not in DOCS:

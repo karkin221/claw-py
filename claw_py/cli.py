@@ -139,9 +139,12 @@ def build_runtime(args: argparse.Namespace) -> ConversationRuntime:
     rag_client = None
     if args.rag_url:
         rag_client = RagClient(RagConfig(base_url=args.rag_url, k=args.rag_k))
-        if rag_client.health():
+        reachable, reason = rag_client.check()
+        if reachable:
             rag_specs = build_rag_tools(rag_client)
-            print(f"  rag: connected to {args.rag_url}", file=sys.stderr)
+            print(
+                f"  rag: connected to {rag_client.config.base_url}", file=sys.stderr
+            )
             if args.rag_auto:
                 hook_registry.register(
                     HookEvent.USER_PROMPT_SUBMIT,
@@ -149,10 +152,8 @@ def build_runtime(args: argparse.Namespace) -> ConversationRuntime:
                 )
                 print("  rag: always-on retrieval enabled", file=sys.stderr)
         else:
-            print(
-                f"  rag: no service at {args.rag_url}; continuing without retrieval",
-                file=sys.stderr,
-            )
+            print(f"  rag: unavailable — {reason}", file=sys.stderr)
+            print("  rag: continuing without retrieval", file=sys.stderr)
             rag_client = None
 
     mcp_specs: list = []

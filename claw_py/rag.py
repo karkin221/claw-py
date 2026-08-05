@@ -41,12 +41,30 @@ FENCE_PREAMBLE = (
 )
 
 
+def normalize_base_url(url: str) -> str:
+    """Accept `127.0.0.1:8001` as well as `http://127.0.0.1:8001`.
+
+    urllib rejects a scheme-less URL with `unknown url type` before opening a
+    socket, which looks identical to the service being down unless the real
+    error is surfaced.
+    """
+    url = (url or "").strip().rstrip("/")
+    if not url:
+        return DEFAULT_BASE_URL
+    if "://" not in url:
+        url = f"http://{url}"
+    return url
+
+
 @dataclass
 class RagConfig:
     base_url: str = DEFAULT_BASE_URL
     k: int = DEFAULT_K
     timeout: float = DEFAULT_TIMEOUT
     include_stubs: bool = False
+
+    def __post_init__(self) -> None:
+        self.base_url = normalize_base_url(self.base_url)
 
 
 def fence_retrieved(body: str, source: str) -> str:
@@ -86,12 +104,31 @@ class RagClient:
         except json.JSONDecodeError as error:
             raise ToolError(f"retrieval service sent malformed json for {path}") from error
 
+    def check(self) -> tuple[bool, str]:
+        """Liveness plus the reason when it fails.
+
+        Deliberately does not parse JSON — a service whose /health returns
+        plain text is alive, and a 404 there may just mean an older build, so
+        /stats is tried as a fallback.
+        """
+        last = ""
+        for path in ("/health", "/stats"):
+            url = f"{self.config.base_url}{path}"
+            try:
+                with urllib.request.urlopen(url, timeout=self.config.timeout) as response:
+                    if response.status < 400:
+                        return True, ""
+                    last = f"{url} returned {response.status}"
+            except urllib.error.HTTPError as error:
+                last = f"{url} returned {error.code}"
+            except urllib.error.URLError as error:
+                return False, f"{url}: {error.reason}"
+            except OSError as error:
+                return False, f"{url}: {error}"
+        return False, last or "no usable health endpoint"
+
     def health(self) -> bool:
-        try:
-            self._get("/health")
-            return True
-        except ToolError:
-            return False
+        return self.check()[0]
 
     def stats(self) -> dict[str, Any]:
         result = self._get("/stats")
