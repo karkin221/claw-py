@@ -27,6 +27,7 @@ from .persistence import (
 from .hooks import HookEvent, HookRegistry, HookResult
 from .permissions import ConsolePrompter, PermissionMode, PermissionPolicy
 from .prompt import build_system_prompt
+from .rag import RagClient, RagConfig, build_rag_tools, retrieve_for_prompt
 from .telemetry import SessionTracer
 from .tools import default_tool_executor
 from .types import RuntimeError, Session
@@ -67,6 +68,18 @@ def flag_empty_results(payload: dict[str, Any]) -> HookResult:
     if payload["output"].strip() in {"no matches", "(empty)", "(no output)"}:
         return HookResult.proceed("tool succeeded but returned nothing usable")
     return HookResult.proceed()
+
+
+def make_retrieval_hook(client: RagClient, k: int):
+    """Always-on retrieval. Runs once per turn, before the prompt is pushed."""
+
+    def hook(payload: dict[str, Any]) -> HookResult:
+        context = retrieve_for_prompt(client, payload["user_input"], k)
+        if not context:
+            return HookResult.proceed()
+        return HookResult.with_context(context, "retrieved corpus context")
+
+    return hook
 
 
 def default_hook_registry() -> HookRegistry:
@@ -121,6 +134,27 @@ def build_runtime(args: argparse.Namespace) -> ConversationRuntime:
 
     # MCP servers start before tool assembly so their tools join the registry
     # like any other, and inherit the same hook and permission pipeline.
+    # Retrieval tools register like any other, so they inherit the same gate.
+    rag_specs: list = []
+    rag_client = None
+    if args.rag_url:
+        rag_client = RagClient(RagConfig(base_url=args.rag_url, k=args.rag_k))
+        if rag_client.health():
+            rag_specs = build_rag_tools(rag_client)
+            print(f"  rag: connected to {args.rag_url}", file=sys.stderr)
+            if args.rag_auto:
+                hook_registry.register(
+                    HookEvent.USER_PROMPT_SUBMIT,
+                    make_retrieval_hook(rag_client, args.rag_k),
+                )
+                print("  rag: always-on retrieval enabled", file=sys.stderr)
+        else:
+            print(
+                f"  rag: no service at {args.rag_url}; continuing without retrieval",
+                file=sys.stderr,
+            )
+            rag_client = None
+
     mcp_specs: list = []
     mcp_manager = None
     if args.mcp_config:
@@ -139,9 +173,11 @@ def build_runtime(args: argparse.Namespace) -> ConversationRuntime:
         except (McpError, OSError, ValueError) as error:
             print(f"  mcp: {error}", file=sys.stderr)
 
+    extra_tools = rag_specs + mcp_specs
+
     if args.no_subagents:
         tool_executor = default_tool_executor()
-        for spec in mcp_specs:
+        for spec in extra_tools:
             tool_executor.register(spec)
     else:
         agent_config = AgentConfig(
@@ -152,7 +188,7 @@ def build_runtime(args: argparse.Namespace) -> ConversationRuntime:
             parent_mode=permission_mode,
             subagent_model=args.subagent_model or args.model,
             max_depth=args.max_agent_depth,
-            extra_tools=mcp_specs,  # subagents see MCP tools too
+            extra_tools=extra_tools,  # subagents see these too
         )
         tool_executor = build_tool_executor(agent_config, depth=0)
 
@@ -254,6 +290,22 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--trace", default=None, help="write JSONL trace to this path")
     parser.add_argument(
         "--mcp-config", default=None, help="path to a .mcp.json server config"
+    )
+    parser.add_argument(
+        "--rag-url",
+        nargs="?",
+        const="http://127.0.0.1:8000",
+        default=None,
+        metavar="URL",
+        help="register rag_search/rag_doc against a retrieval service",
+    )
+    parser.add_argument(
+        "--rag-auto",
+        action="store_true",
+        help="retrieve before every turn instead of waiting for the model to ask",
+    )
+    parser.add_argument(
+        "--rag-k", type=int, default=5, help="passages per retrieval (default 5)"
     )
     parser.add_argument(
         "--resume",

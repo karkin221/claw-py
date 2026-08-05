@@ -40,6 +40,13 @@ from .permissions import (
     PermissionOutcome,
     PermissionPolicy,
 )
+from .rag import (
+    RagClient,
+    RagConfig,
+    build_rag_tools,
+    fence_retrieved,
+    retrieve_for_prompt,
+)
 from .telemetry import SessionTracer
 from .tools import (
     RISK_ESCALATE,
@@ -84,6 +91,8 @@ __all__ = [
     "RISK_ESCALATE",
     "RISK_READ",
     "RISK_WRITE",
+    "RagClient",
+    "RagConfig",
     "Session",
     "SessionEnvironment",
     "SessionInfo",
@@ -97,12 +106,14 @@ __all__ = [
     "bridge_mcp_tool",
     "build_agent_system_prompt",
     "build_assistant_message",
+    "build_rag_tools",
     "build_tool_executor",
     "compact_session",
     "default_tool_executor",
     "describe_environment_drift",
     "deserialize_message",
     "execute_agent",
+    "fence_retrieved",
     "list_sessions",
     "load_mcp_config",
     "make_agent_tool",
@@ -110,5 +121,6 @@ __all__ = [
     "normalize_subagent_type",
     "replay_environment",
     "replay_session",
+    "retrieve_for_prompt",
     "serialize_message",
 ]

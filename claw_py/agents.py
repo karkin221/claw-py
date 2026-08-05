@@ -92,6 +92,22 @@ AGENT_SPECS: dict[str, AgentSpec] = {
         mode=PermissionMode.WORKSPACE_WRITE,
         max_iterations=10,
     ),
+    "research": AgentSpec(
+        subagent_type="research",
+        purpose="Answer a question from the document corpus, with citations.",
+        instructions=(
+            "Search the corpus, read what comes back, and search again with "
+            "better terms if the first attempt misses. If a passage looks "
+            "truncated or the answer sits just outside it, fetch the full "
+            "document by slug. Report findings with the author, title and date "
+            "attached to each claim. If the corpus does not answer the "
+            "question, say so plainly rather than filling the gap from general "
+            "knowledge."
+        ),
+        allowed_tools=frozenset(READ_TOOLS | {"rag_search", "rag_doc"}),
+        mode=PermissionMode.READ_ONLY,
+        max_iterations=10,
+    ),
     "general-purpose": AgentSpec(
         subagent_type="general-purpose",
         purpose="Carry out a self-contained task end to end.",
@@ -121,6 +137,7 @@ def normalize_subagent_type(value: Optional[str]) -> str:
         ("planner", "plan"), ("planning", "plan"),
         ("verify", "verification"), ("verifier", "verification"), ("test", "verification"),
         ("general", "general-purpose"), ("generalpurpose", "general-purpose"),
+        ("rag", "research"), ("retrieve", "research"), ("corpus", "research"),
     ):
         if candidate == alias:
             return target

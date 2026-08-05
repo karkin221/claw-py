@@ -102,7 +102,20 @@ class ConversationRuntime:
                 ) from error
 
         self.record_turn_started(user_input)
-        self.session.push_user_text(user_input)
+
+        # Always-on retrieval seam. The augmented text becomes the actual user
+        # message, so the history and the trace both show exactly what the
+        # model saw — injecting at request-assembly time instead would make a
+        # replayed session diverge from the one that produced it.
+        prompt_hook_result = self.run_user_prompt_submit_hook(user_input)
+        context = prompt_hook_result.additional_context()
+        if context:
+            augmented = f"{context}\n\n{user_input}"
+            self.record_user_prompt_augmented(user_input, context)
+        else:
+            augmented = user_input
+
+        self.session.push_user_text(augmented)
         self.record_message_appended(self.session.messages[-1])
 
         assistant_messages: list[ConversationMessage] = []
@@ -350,6 +363,11 @@ class ConversationRuntime:
     # hooks
     # ------------------------------------------------------------------
 
+    def run_user_prompt_submit_hook(self, user_input: str) -> HookResult:
+        return self.hook_registry.run(
+            HookEvent.USER_PROMPT_SUBMIT, {"user_input": user_input}
+        )
+
     def run_pre_tool_use_hook(self, tool_name: str, input: dict[str, Any]) -> HookResult:
         return self.hook_registry.run(
             HookEvent.PRE_TOOL_USE, {"tool_name": tool_name, "input": input}
@@ -464,6 +482,16 @@ class ConversationRuntime:
 
         self.session_tracer.emit(
             "message_appended", message=serialize_message(message)
+        )
+
+    def record_user_prompt_augmented(self, user_input: str, context: str) -> None:
+        """Something was prepended to the turn. The augmented text is already
+        in `message_appended`; this records the split so you can tell what the
+        person typed from what was retrieved for them."""
+        self.session_tracer.emit(
+            "user_prompt_augmented",
+            prompt_chars=len(user_input),
+            context_chars=len(context),
         )
 
     def record_permission_decision(

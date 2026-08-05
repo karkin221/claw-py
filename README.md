@@ -198,13 +198,42 @@ python -m claw_py.cli --trace t.jsonl --resume --rebuild-prompt "..."  # ignore
                                                             # the recorded prompt
 ```
 
-### 6. Run the tests
+### 6. Retrieval: tools, always-on injection, delegation
+
+```bash
+python examples/demo_rag.py
+```
+
+Offline — spins up a stand-in retrieval service and runs one question through
+all three seams:
+
+```
+  seam              iterations  session tokens
+  --------------------------------------------
+  model-decided              2             283
+  always-on                  1             234
+  delegated                  2             144
+```
+
+Against a real service (e.g. `substack-rag` on `127.0.0.1:8000`):
+
+```bash
+python -m claw_py.cli --rag-url "what did Citrini say about leverage unwinds"
+python -m claw_py.cli --rag-url --rag-auto "..."     # retrieve every turn
+python -m claw_py.cli --rag-url --rag-k 8 "..."      # more passages
+```
+
+`--rag-url` registers `rag_search` and `rag_doc`; `--rag-auto` additionally
+retrieves before every turn via the `UserPromptSubmit` hook. Both paths fence
+retrieved text as data, and both go through the normal permission gate.
+
+### 7. Run the tests
 
 ```bash
 python -m unittest discover -s tests -v
 ```
 
-118 tests, no network, no model. They cover the loop, the iteration cap, tool
+154 tests, no network, no model. They cover the loop, the iteration cap, tool
 failures, all five permission modes, hook rewrite/deny/override, post-hook error
 flipping, compaction, the session health probe, subagent tool restriction, mode
 narrowing, depth limiting, hook inheritance, context isolation, the router's
@@ -233,6 +262,7 @@ claw-py/
 │   ├── compact.py          token estimation and history rewriting
 │   ├── agents.py           subagents: the agent tool, restriction, depth
 │   ├── mcp.py              MCP stdio client and tool bridging
+│   ├── rag.py              retrieval tools + always-on injection
 │   ├── persistence.py      resume by replaying the trace
 │   ├── routing.py          optional LiteLLM multi-provider router
 │   ├── prompt.py           system prompt assembly
@@ -242,11 +272,14 @@ claw-py/
 │   ├── demo_offline.py     the gating pipeline, no model needed
 │   ├── demo_subagents.py   delegation and isolation, no model needed
 │   ├── demo_advanced.py    MCP, parallel dispatch, resume
-│   └── mcp_echo_server.py  a real stdio MCP server, for testing
+│   ├── demo_rag.py         the three retrieval seams, compared
+│   ├── mcp_echo_server.py  a real stdio MCP server, for testing
+│   └── fake_rag_server.py  a stand-in retrieval service, for testing
 └── tests/
     ├── test_loop.py        the loop, gating, compaction
     ├── test_agents.py      subagents and routing
-    └── test_infra.py       MCP, persistence, parallel dispatch
+    ├── test_infra.py       MCP, persistence, parallel dispatch
+    └── test_rag.py         retrieval tools and injection seams
 ```
 
 **If you read one file, read `claw_py/conversation.py`.** Everything else is a

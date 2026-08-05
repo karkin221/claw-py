@@ -13,6 +13,10 @@ from typing import Any, Callable, Optional
 
 
 class HookEvent(Enum):
+    # Not in the Rust original, which has only the three tool events. This is
+    # the seam for always-on retrieval: it fires once per turn, before the
+    # user message is pushed.
+    USER_PROMPT_SUBMIT = "UserPromptSubmit"
     PRE_TOOL_USE = "PreToolUse"
     POST_TOOL_USE = "PostToolUse"
     POST_TOOL_USE_FAILURE = "PostToolUseFailure"
@@ -28,6 +32,7 @@ class HookResult:
     _permission_override: Optional[str] = None
     _permission_reason: Optional[str] = None
     _messages: list[str] = field(default_factory=list)
+    _additional_context: Optional[str] = None
 
     # Accessors named after the Rust methods the runtime calls.
     def updated_input(self) -> Optional[dict[str, Any]]:
@@ -41,6 +46,10 @@ class HookResult:
 
     def messages(self) -> list[str]:
         return self._messages
+
+    def additional_context(self) -> Optional[str]:
+        """Text a UserPromptSubmit hook wants prepended to the user's turn."""
+        return self._additional_context
 
     def is_denied(self) -> bool:
         return self.decision == "deny"
@@ -59,6 +68,12 @@ class HookResult:
     @classmethod
     def rewrite(cls, updated_input: dict[str, Any], message: Optional[str] = None) -> "HookResult":
         return cls(_updated_input=updated_input, _messages=[message] if message else [])
+
+    @classmethod
+    def with_context(cls, context: str, message: Optional[str] = None) -> "HookResult":
+        return cls(
+            _additional_context=context, _messages=[message] if message else []
+        )
 
     @classmethod
     def deny(cls, reason: str) -> "HookResult":
@@ -95,6 +110,13 @@ class HookRegistry:
             result = hook(payload)
             folded._messages.extend(result.messages())
 
+            if result.additional_context():
+                existing = folded._additional_context
+                folded._additional_context = (
+                    f"{existing}\n\n{result.additional_context()}"
+                    if existing
+                    else result.additional_context()
+                )
             if result.updated_input() is not None:
                 folded._updated_input = result.updated_input()
                 payload = {**payload, "input": result.updated_input()}
